@@ -1,11 +1,11 @@
 module github.com/fenthope/jwt
 
-go 1.24.3
+go 1.24.4
 
 require (
 	github.com/appleboy/gofight/v2 v2.1.2
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	github.com/infinite-iroha/touka v0.0.11
+	github.com/infinite-iroha/touka v0.2.8
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/gjson v1.17.1
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
@@ -13,11 +13,10 @@ require (
 
 require (
 	github.com/WJQSERVER-STUDIO/go-utils/copyb v0.0.4 // indirect
-	github.com/WJQSERVER-STUDIO/httpc v0.5.1 // indirect
+	github.com/WJQSERVER-STUDIO/httpc v0.7.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/fenthope/reco v0.0.1 // indirect
+	github.com/fenthope/reco v0.0.3 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250517221953-25912455fbc8 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.8.0 // indirect
