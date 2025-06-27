@@ -3,7 +3,7 @@ module github.com/fenthope/jwt
 go 1.24.4
 
 require (
-	github.com/appleboy/gofight/v2 v2.1.2
+	github.com/appleboy/gofight/v2 v2.2.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/infinite-iroha/touka v0.2.8
 	github.com/stretchr/testify v1.10.0
