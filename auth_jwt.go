@@ -1,291 +1,264 @@
 package jwt
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/rsa"
-	"encoding/json"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/fenthope/jwt/core"
+	"github.com/fenthope/jwt/store"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/infinite-iroha/touka"
 	"github.com/youmark/pkcs8"
 )
 
 type MapClaims jwt.MapClaims
 
-// ToukaJWTMiddleware provides a Json-Web-Token authentication implementation. On failure, a 401 HTTP response
-// is returned. On success, the wrapped middleware is called, and the userID is made available as
-// c.Get("userID").(string).
-// Users can get a token by posting a json request to LoginHandler. The token then needs to be passed in
-// the Authentication header. Example: Authorization:Bearer XXX_TOKEN_XXX
 type ToukaJWTMiddleware struct {
-	// Realm name to display to the user. Required.
-	Realm string
-
-	// signing algorithm - possible values are HS256, HS384, HS512, RS256, RS384 or RS512
-	// Optional, default is HS256.
+	Realm            string
 	SigningAlgorithm string
+	Key              []byte
+	KeyFunc          func(token *jwt.Token) (any, error)
+	Timeout          time.Duration
+	TimeoutFunc      func(data any) time.Duration
 
-	// Secret key used for signing. Required.
-	Key []byte
+	MaxRefresh          time.Duration
+	RefreshTokenTimeout time.Duration
 
-	// Callback to retrieve key used for signing. Setting KeyFunc will bypass
-	// all other key settings
-	KeyFunc func(token *jwt.Token) (interface{}, error)
-
-	// Duration that a jwt token is valid. Optional, defaults to one hour.
-	Timeout time.Duration
-	// Callback function that will override the default timeout duration.
-	TimeoutFunc func(data interface{}) time.Duration
-
-	// This field allows clients to refresh their token until MaxRefresh has passed.
-	// Note that clients can refresh their token in the last moment of MaxRefresh.
-	// This means that the maximum validity timespan for a token is TokenTime + MaxRefresh.
-	// Optional, defaults to 0 meaning not refreshable.
-	MaxRefresh time.Duration
-
-	// Callback function that should perform the authentication of the user based on login info.
-	// Must return user data as user identifier, it will be stored in Claim Array. Required.
-	// Check error (e) to determine the appropriate error message.
-	Authenticator func(c *touka.Context) (interface{}, error)
-
-	// Callback function that should perform the authorization of the authenticated user. Called
-	// only after an authentication success. Must return true on success, false on failure.
-	// Optional, default to success.
-	Authorizator func(data interface{}, c *touka.Context) bool
-
-	// Callback function that will be called during login.
-	// Using this function it is possible to add additional payload data to the webtoken.
-	// The data is then made available during requests via c.Get("JWT_PAYLOAD").
-	// Note that the payload is not encrypted.
-	// The attributes mentioned on jwt.io can't be used as keys for the map.
-	// Optional, by default no additional data will be set.
-	PayloadFunc func(data interface{}) MapClaims
-
-	// User can define own Unauthorized func.
-	Unauthorized func(c *touka.Context, code int, message string)
-
-	// User can define own LoginResponse func.
-	LoginResponse func(c *touka.Context, code int, message string, time time.Time)
-
-	// User can define own LogoutResponse func.
-	LogoutResponse func(c *touka.Context, code int)
-
-	// User can define own RefreshResponse func.
-	RefreshResponse func(c *touka.Context, code int, message string, time time.Time)
-
-	// Set the identity handler function
-	IdentityHandler func(*touka.Context) interface{}
-
-	// Set the identity key
-	IdentityKey string
-
-	// TokenLookup is a string in the form of "<source>:<name>" that is used
-	// to extract token from the request.
-	// Optional. Default value "header:Authorization".
-	// Possible values:
-	// - "header:<name>"
-	// - "query:<name>"
-	// - "cookie:<name>"
-	TokenLookup string
-
-	// TokenHeadName is a string in the header. Default value is "Bearer"
-	TokenHeadName string
-
-	// TimeFunc provides the current time. You can override it to use another time value. This is useful for testing or if your server uses a different time zone than your tokens.
-	TimeFunc func() time.Time
-
-	// HTTP Status messages for when something in the JWT middleware fails.
-	// Check error (e) to determine the appropriate error message.
+	Authenticator         func(c *touka.Context) (any, error)
+	Authorizator          func(data any, c *touka.Context) bool
+	LoginResponse         func(c *touka.Context, code int, token *core.Token)
+	LogoutResponse        func(c *touka.Context, code int)
+	RefreshResponse       func(c *touka.Context, code int, token *core.Token)
+	Unauthorized          func(c *touka.Context, code int, message string)
 	HTTPStatusMessageFunc func(e error, c *touka.Context) string
 
-	// Private key file for asymmetric algorithms
-	PrivKeyFile string
+	IdentityKey   string
+	TokenLookup   string
+	TokenHeadName string
+	TimeFunc      func() time.Time
 
-	// Private Key bytes for asymmetric algorithms
-	//
-	// Note: PrivKeyFile takes precedence over PrivKeyBytes if both are set
-	PrivKeyBytes []byte
-
-	// Public key file for asymmetric algorithms
-	PubKeyFile string
-
-	// Private key passphrase
-	PrivateKeyPassphrase string
-
-	// Public key bytes for asymmetric algorithms.
-	//
-	// Note: PubKeyFile takes precedence over PubKeyBytes if both are set
-	PubKeyBytes []byte
-
-	// Private key
-	privKey *rsa.PrivateKey
-
-	// Public key
-	pubKey *rsa.PublicKey
-
-	// Optionally return the token as a cookie
-	SendCookie bool
-
-	// Duration that a cookie is valid. Optional, by default equals to Timeout value.
-	CookieMaxAge time.Duration
-
-	// Allow insecure cookies for development over http
-	SecureCookie bool
-
-	// Allow cookies to be accessed client side for development
+	DisabledAbort  bool
+	ExpField       string
+	SendCookie     bool
+	CookieName     string
+	CookieMaxAge   time.Duration
+	CookieDomain   string
+	SecureCookie   bool
 	CookieHTTPOnly bool
-
-	// Allow cookie domain change for development
-	CookieDomain string
-
-	// SendAuthorization allow return authorization header for every request
-	SendAuthorization bool
-
-	// Disable abort() of context.
-	DisabledAbort bool
-
-	// CookieName allow cookie name change for development
-	CookieName string
-
-	// CookieSameSite allow use http.SameSite cookie param
 	CookieSameSite http.SameSite
 
-	// ParseOptions allow to modify jwt's parser methods
-	ParseOptions []jwt.ParserOption
+	RefreshTokenCookieName string
 
-	// Default vaule is "exp"
-	ExpField string
+	PayloadFunc       func(data any) MapClaims
+	IdentityHandler   func(c *touka.Context) any
+	ParseOptions      []jwt.ParserOption
+	SendAuthorization bool
+
+	PrivKeyFile          string
+	PrivKeyBytes         []byte
+	PubKeyFile           string
+	PubKeyBytes          []byte
+	PrivateKeyPassphrase string
+
+	TokenStore core.TokenStore
+
+	privKey       *rsa.PrivateKey
+	pubKey        *rsa.PublicKey
+	inMemoryStore *store.InMemoryRefreshTokenStore
 }
 
 var (
-	// ErrMissingSecretKey indicates Secret key is required
-	ErrMissingSecretKey = errors.New("secret key is required")
-
-	// ErrForbidden when HTTP status 403 is given
-	ErrForbidden = errors.New("you don't have permission to access this resource")
-
-	// ErrMissingAuthenticatorFunc indicates Authenticator is required
-	ErrMissingAuthenticatorFunc = errors.New("ToukaJWTMiddleware.Authenticator func is undefined")
-
-	// ErrMissingLoginValues indicates a user tried to authenticate without username or password
-	ErrMissingLoginValues = errors.New("missing Username or Password")
-
-	// ErrFailedAuthentication indicates authentication failed, could be faulty username or password
-	ErrFailedAuthentication = errors.New("incorrect Username or Password")
-
-	// ErrFailedTokenCreation indicates JWT Token failed to create, reason unknown
-	ErrFailedTokenCreation = errors.New("failed to create JWT Token")
-
-	// ErrExpiredToken indicates JWT token has expired. Can't refresh.
-	ErrExpiredToken = errors.New("token is expired") // in practice, this is generated from the jwt library not by us
-
-	// ErrEmptyAuthHeader can be thrown if authing with a HTTP header, the Auth header needs to be set
-	ErrEmptyAuthHeader = errors.New("auth header is empty")
-
-	// ErrMissingExpField missing exp field in token
-	ErrMissingExpField = errors.New("missing exp field")
-
-	// ErrWrongFormatOfExp field must be float64 format
-	ErrWrongFormatOfExp = errors.New("exp must be float64 format")
-
-	// ErrInvalidAuthHeader indicates auth header is invalid, could for example have the wrong Realm name
-	ErrInvalidAuthHeader = errors.New("auth header is invalid")
-
-	// ErrEmptyQueryToken can be thrown if authing with URL Query, the query token variable is empty
-	ErrEmptyQueryToken = errors.New("query token is empty")
-
-	// ErrEmptyCookieToken can be thrown if authing with a cookie, the token cookie is empty
-	ErrEmptyCookieToken = errors.New("cookie token is empty")
-
-	// ErrEmptyParamToken can be thrown if authing with parameter in path, the parameter in path is empty
-	ErrEmptyParamToken = errors.New("parameter token is empty")
-
-	// ErrInvalidSigningAlgorithm indicates signing algorithm is invalid, needs to be HS256, HS384, HS512, RS256, RS384 or RS512
-	ErrInvalidSigningAlgorithm = errors.New("invalid signing algorithm")
-
-	// ErrNoPrivKeyFile indicates that the given private key is unreadable
-	ErrNoPrivKeyFile = errors.New("private key file unreadable")
-
-	// ErrNoPubKeyFile indicates that the given public key is unreadable
-	ErrNoPubKeyFile = errors.New("public key file unreadable")
-
-	// ErrInvalidPrivKey indicates that the given private key is invalid
-	ErrInvalidPrivKey = errors.New("private key invalid")
-
-	// ErrInvalidPubKey indicates the the given public key is invalid
-	ErrInvalidPubKey = errors.New("public key invalid")
-
-	// IdentityKey default identity key
-	IdentityKey = "identity"
+	ErrMissingRealm             = errors.New("realm is missing")
+	ErrMissingSecretKey         = errors.New("secret key is missing")
+	ErrForbidden                = errors.New("you don't have permission to access")
+	ErrMissingAuthenticatorFunc = errors.New("authenticator function is missing")
+	ErrMissingExpField          = errors.New("missing exp field")
+	ErrWrongFormatOfExp         = errors.New("wrong format of exp field")
+	ErrInvalidSigningAlgorithm  = errors.New("invalid signing algorithm")
+	ErrNoPrivKeyFile            = errors.New("private key file is missing")
+	ErrNoPubKeyFile             = errors.New("public key file is missing")
+	ErrInvalidPrivKey           = errors.New("invalid private key")
+	ErrInvalidPubKey            = errors.New("invalid public key")
+	ErrEmptyAuthHeader          = errors.New("auth header is empty")
+	ErrInvalidAuthHeader        = errors.New("auth header is invalid")
+	ErrEmptyQueryToken          = errors.New("query token is empty")
+	ErrEmptyCookieToken         = errors.New("cookie token is empty")
+	ErrEmptyParamToken          = errors.New("parameter token is empty")
+	ErrFailedAuthentication     = errors.New("incorrect Username or Password")
+	ErrMissingLoginValues       = errors.New("missing Username or Password")
+	ErrFailedTokenCreation      = errors.New("failed to create token")
+	ErrExpiredToken             = errors.New("token is expired")
+	ErrMissingRefreshToken      = errors.New("refresh token is missing")
 )
 
-// New for check error with ToukaJWTMiddleware
-func New(m *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error) {
-	if err := m.MiddlewareInit(); err != nil {
+func New(mw *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error) {
+	if err := mw.MiddlewareInit(); err != nil {
 		return nil, err
 	}
-
-	return m, nil
+	return mw, nil
 }
 
-func (mw *ToukaJWTMiddleware) readKeys() error {
-	err := mw.privateKey()
-	if err != nil {
-		return err
+func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
+	if mw.TokenLookup == "" {
+		mw.TokenLookup = "header:Authorization"
+	}
+	if mw.SigningAlgorithm == "" {
+		mw.SigningAlgorithm = "HS256"
+	}
+	if mw.Timeout == 0 {
+		mw.Timeout = time.Hour
+	}
+	if mw.TimeFunc == nil {
+		mw.TimeFunc = time.Now
+	}
+	if mw.TimeoutFunc == nil {
+		mw.TimeoutFunc = func(data any) time.Duration { return mw.Timeout }
+	}
+	if mw.IdentityKey == "" {
+		mw.IdentityKey = "identity"
+	}
+	if mw.TokenHeadName == "" {
+		mw.TokenHeadName = "Bearer"
+	}
+	if mw.ExpField == "" {
+		mw.ExpField = "exp"
+	}
+	if mw.CookieName == "" {
+		mw.CookieName = "jwt"
+	}
+	if mw.RefreshTokenCookieName == "" {
+		mw.RefreshTokenCookieName = "refresh_token"
+	}
+	if mw.RefreshTokenTimeout == 0 {
+		if mw.MaxRefresh != 0 {
+			mw.RefreshTokenTimeout = mw.MaxRefresh
+		} else {
+			mw.RefreshTokenTimeout = time.Hour * 24 * 7
+		}
 	}
 
-	err = mw.publicKey()
-	if err != nil {
-		return err
+	if mw.Authorizator == nil {
+		mw.Authorizator = func(data any, c *touka.Context) bool { return true }
+	}
+	if mw.Unauthorized == nil {
+		mw.Unauthorized = func(c *touka.Context, code int, message string) {
+			c.JSON(code, touka.H{"code": code, "message": message})
+		}
+	}
+	if mw.LoginResponse == nil {
+		mw.LoginResponse = func(c *touka.Context, code int, token *core.Token) {
+			c.JSON(code, touka.H{
+				"code":          code,
+				"access_token":  token.AccessToken,
+				"refresh_token": token.RefreshToken,
+				"expire":        time.Unix(token.ExpiresAt, 0).Format(time.RFC3339),
+			})
+		}
+	}
+	if mw.LogoutResponse == nil {
+		mw.LogoutResponse = func(c *touka.Context, code int) {
+			c.JSON(code, touka.H{"code": code})
+		}
+	}
+	if mw.RefreshResponse == nil {
+		mw.RefreshResponse = func(c *touka.Context, code int, token *core.Token) {
+			c.JSON(code, touka.H{
+				"code":          code,
+				"access_token":  token.AccessToken,
+				"refresh_token": token.RefreshToken,
+				"expire":        time.Unix(token.ExpiresAt, 0).Format(time.RFC3339),
+			})
+		}
+	}
+	if mw.IdentityHandler == nil {
+		mw.IdentityHandler = func(c *touka.Context) any {
+			claims := ExtractClaims(c)
+			return claims[mw.IdentityKey]
+		}
+	}
+	if mw.HTTPStatusMessageFunc == nil {
+		mw.HTTPStatusMessageFunc = func(e error, c *touka.Context) string {
+			if e == nil {
+				return ""
+			}
+			return e.Error()
+		}
+	}
+
+	if mw.TokenStore == nil {
+		mw.inMemoryStore = store.NewInMemoryRefreshTokenStore()
+		mw.TokenStore = mw.inMemoryStore
+	}
+
+	if mw.Realm == "" {
+		return ErrMissingRealm
+	}
+	if mw.usingPublicKeyAlgo() {
+		return mw.readKeys()
+	}
+	if mw.Key == nil {
+		return ErrMissingSecretKey
 	}
 	return nil
 }
 
+func (mw *ToukaJWTMiddleware) readKeys() error {
+	if err := mw.privateKey(); err != nil {
+		return err
+	}
+	return mw.publicKey()
+}
+
 func (mw *ToukaJWTMiddleware) privateKey() error {
 	var keyData []byte
-	var err error
 	if mw.PrivKeyFile == "" {
-		keyData = mw.PrivKeyBytes
+		if len(mw.PrivKeyBytes) > 0 {
+			keyData = mw.PrivKeyBytes
+		} else {
+			return ErrNoPrivKeyFile
+		}
 	} else {
-		var filecontent []byte
-		filecontent, err = os.ReadFile(mw.PrivKeyFile)
+		filecontent, err := os.ReadFile(mw.PrivKeyFile)
 		if err != nil {
 			return ErrNoPrivKeyFile
 		}
 		keyData = filecontent
 	}
-
 	if mw.PrivateKeyPassphrase != "" {
-		var key interface{}
-		key, err = pkcs8.ParsePKCS8PrivateKey(keyData, []byte(mw.PrivateKeyPassphrase))
+		key, err := pkcs8.ParsePKCS8PrivateKey(keyData, []byte(mw.PrivateKeyPassphrase))
 		if err != nil {
 			return ErrInvalidPrivKey
 		}
-		rsaKey, ok := key.(*rsa.PrivateKey)
+		var ok bool
+		mw.privKey, ok = key.(*rsa.PrivateKey)
 		if !ok {
 			return ErrInvalidPrivKey
 		}
-		mw.privKey = rsaKey
-		return nil
+	} else {
+		key, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
+		if err != nil {
+			return ErrInvalidPrivKey
+		}
+		mw.privKey = key
 	}
-
-	var key *rsa.PrivateKey
-	key, err = jwt.ParseRSAPrivateKeyFromPEM(keyData)
-	if err != nil {
-		return ErrInvalidPrivKey
-	}
-	mw.privKey = key
 	return nil
 }
 
 func (mw *ToukaJWTMiddleware) publicKey() error {
 	var keyData []byte
 	if mw.PubKeyFile == "" {
-		keyData = mw.PubKeyBytes
+		if len(mw.PubKeyBytes) > 0 {
+			keyData = mw.PubKeyBytes
+		} else {
+			return ErrNoPubKeyFile
+		}
 	} else {
 		filecontent, err := os.ReadFile(mw.PubKeyFile)
 		if err != nil {
@@ -293,7 +266,6 @@ func (mw *ToukaJWTMiddleware) publicKey() error {
 		}
 		keyData = filecontent
 	}
-
 	key, err := jwt.ParseRSAPublicKeyFromPEM(keyData)
 	if err != nil {
 		return ErrInvalidPubKey
@@ -304,136 +276,17 @@ func (mw *ToukaJWTMiddleware) publicKey() error {
 
 func (mw *ToukaJWTMiddleware) usingPublicKeyAlgo() bool {
 	switch mw.SigningAlgorithm {
-	case "RS256", "RS512", "RS384":
+	case "RS256", "RS384", "RS512":
 		return true
 	}
 	return false
 }
 
-// MiddlewareInit initialize jwt configs.
-func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
-	if mw.TokenLookup == "" {
-		mw.TokenLookup = "header:Authorization"
-	}
-
-	if mw.SigningAlgorithm == "" {
-		mw.SigningAlgorithm = "HS256"
-	}
-
-	if mw.Timeout == 0 {
-		mw.Timeout = time.Hour
-	}
-
-	if mw.TimeoutFunc == nil {
-		mw.TimeoutFunc = func(data interface{}) time.Duration {
-			return mw.Timeout
-		}
-	}
-
-	if mw.TimeFunc == nil {
-		mw.TimeFunc = time.Now
-	}
-
-	mw.TokenHeadName = strings.TrimSpace(mw.TokenHeadName)
-	if len(mw.TokenHeadName) == 0 {
-		mw.TokenHeadName = "Bearer"
-	}
-
-	if mw.Authorizator == nil {
-		mw.Authorizator = func(data interface{}, c *touka.Context) bool {
-			return true
-		}
-	}
-
-	if mw.Unauthorized == nil {
-		mw.Unauthorized = func(c *touka.Context, code int, message string) {
-			c.JSON(code, touka.H{
-				"code":    code,
-				"message": message,
-			})
-		}
-	}
-
-	if mw.LoginResponse == nil {
-		mw.LoginResponse = func(c *touka.Context, code int, token string, expire time.Time) {
-			c.JSON(http.StatusOK, touka.H{
-				"code":   http.StatusOK,
-				"token":  token,
-				"expire": expire.Format(time.RFC3339),
-			})
-		}
-	}
-
-	if mw.LogoutResponse == nil {
-		mw.LogoutResponse = func(c *touka.Context, code int) {
-			c.JSON(http.StatusOK, touka.H{
-				"code": http.StatusOK,
-			})
-		}
-	}
-
-	if mw.RefreshResponse == nil {
-		mw.RefreshResponse = func(c *touka.Context, code int, token string, expire time.Time) {
-			c.JSON(http.StatusOK, touka.H{
-				"code":   http.StatusOK,
-				"token":  token,
-				"expire": expire.Format(time.RFC3339),
-			})
-		}
-	}
-
-	if mw.IdentityKey == "" {
-		mw.IdentityKey = IdentityKey
-	}
-
-	if mw.IdentityHandler == nil {
-		mw.IdentityHandler = func(c *touka.Context) interface{} {
-			claims := ExtractClaims(c)
-			return claims[mw.IdentityKey]
-		}
-	}
-
-	if mw.HTTPStatusMessageFunc == nil {
-		mw.HTTPStatusMessageFunc = func(e error, c *touka.Context) string {
-			return e.Error()
-		}
-	}
-
-	if mw.Realm == "" {
-		mw.Realm = " jwt"
-	}
-
-	if mw.CookieMaxAge == 0 {
-		mw.CookieMaxAge = mw.Timeout
-	}
-
-	if mw.CookieName == "" {
-		mw.CookieName = "jwt"
-	}
-
-	if mw.ExpField == "" {
-		mw.ExpField = "exp"
-	}
-
-	// bypass other key settings if KeyFunc is set
-	if mw.KeyFunc != nil {
-		return nil
-	}
-
-	if mw.usingPublicKeyAlgo() {
-		return mw.readKeys()
-	}
-
-	if mw.Key == nil {
-		return ErrMissingSecretKey
-	}
-
-	return nil
-}
-
-// MiddlewareFunc makes ToukaJWTMiddleware implement the Middleware interface.
 func (mw *ToukaJWTMiddleware) MiddlewareFunc() touka.HandlerFunc {
 	return func(c *touka.Context) {
+		if mw == nil {
+			return
+		}
 		mw.middlewareImpl(c)
 	}
 }
@@ -441,416 +294,250 @@ func (mw *ToukaJWTMiddleware) MiddlewareFunc() touka.HandlerFunc {
 func (mw *ToukaJWTMiddleware) middlewareImpl(c *touka.Context) {
 	claims, err := mw.GetClaimsFromJWT(c)
 	if err != nil {
-		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
+		mw.handleTokenError(c, err)
 		return
 	}
-
-	switch v := claims[mw.ExpField].(type) {
-	case nil:
+	if claims[mw.ExpField] == nil {
 		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingExpField, c))
 		return
-	case float64:
-		if int64(v) < mw.TimeFunc().Unix() {
-			mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrExpiredToken, c))
-			return
-		}
-	case json.Number:
-		n, err := v.Int64()
-		if err != nil {
-			mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrWrongFormatOfExp, c))
-			return
-		}
-		if n < mw.TimeFunc().Unix() {
-			mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrExpiredToken, c))
-			return
-		}
-	default:
-		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrWrongFormatOfExp, c))
-		return
 	}
-
 	c.Set("JWT_PAYLOAD", claims)
 	identity := mw.IdentityHandler(c)
-
 	if identity != nil {
 		c.Set(mw.IdentityKey, identity)
 	}
-
 	if !mw.Authorizator(identity, c) {
 		mw.unauthorized(c, http.StatusForbidden, mw.HTTPStatusMessageFunc(ErrForbidden, c))
 		return
 	}
-
 	c.Next()
 }
 
-// GetClaimsFromJWT get claims from JWT token
-func (mw *ToukaJWTMiddleware) GetClaimsFromJWT(c *touka.Context) (MapClaims, error) {
+func (mw *ToukaJWTMiddleware) GetClaimsFromJWT(c *touka.Context) (jwt.MapClaims, error) {
 	token, err := mw.ParseToken(c)
 	if err != nil {
 		return nil, err
 	}
-
 	if mw.SendAuthorization {
 		if v, ok := c.Get("JWT_TOKEN"); ok {
 			c.SetHeader("Authorization", mw.TokenHeadName+" "+v.(string))
 		}
 	}
-
-	claims := MapClaims{}
-	for key, value := range token.Claims.(jwt.MapClaims) {
-		claims[key] = value
-	}
-
-	return claims, nil
+	return token.Claims.(jwt.MapClaims), nil
 }
 
-// LoginHandler can be used by clients to get a jwt token.
-// Payload needs to be json in the form of {"username": "USERNAME", "password": "PASSWORD"}.
-// Reply will be of the form {"token": "TOKEN"}.
 func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 	if mw.Authenticator == nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(ErrMissingAuthenticatorFunc, c))
 		return
 	}
-
 	data, err := mw.Authenticator(c)
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-
-	// Create the token
-	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
-	claims := token.Claims.(jwt.MapClaims)
-
-	if mw.PayloadFunc != nil {
-		for key, value := range mw.PayloadFunc(data) {
-			claims[key] = value
-		}
-	}
-
-	expire := mw.TimeFunc().Add(mw.TimeoutFunc(claims))
-	claims[mw.ExpField] = expire.Unix()
-	claims["orig_iat"] = mw.TimeFunc().Unix()
-	tokenString, err := mw.signedString(token)
+	tokenPair, err := mw.TokenGenerator(c.Request.Context(), data)
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrFailedTokenCreation, c))
 		return
 	}
-
-	mw.SetCookie(c, tokenString)
-
-	mw.LoginResponse(c, http.StatusOK, tokenString, expire)
+	mw.SetCookie(c, tokenPair.AccessToken)
+	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken)
+	mw.LoginResponse(c, http.StatusOK, tokenPair)
 }
 
-// LogoutHandler can be used by clients to remove the jwt cookie (if set)
 func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
-	// delete auth cookie
 	if mw.SendCookie {
-		if mw.CookieSameSite != 0 {
-			c.SetSameSite(mw.CookieSameSite)
-		}
-
-		c.SetCookie(
-			mw.CookieName,
-			"",
-			-1,
-			"/",
-			mw.CookieDomain,
-			mw.SecureCookie,
-			mw.CookieHTTPOnly,
-		)
+		c.SetCookie(mw.CookieName, "", -1, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
+		c.SetCookie(mw.RefreshTokenCookieName, "", -1, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
 	}
-
 	mw.LogoutResponse(c, http.StatusOK)
 }
 
-func (mw *ToukaJWTMiddleware) signedString(token *jwt.Token) (string, error) {
-	var tokenString string
-	var err error
-	if mw.usingPublicKeyAlgo() {
-		tokenString, err = token.SignedString(mw.privKey)
-	} else {
-		tokenString, err = token.SignedString(mw.Key)
-	}
-	return tokenString, err
-}
-
-// RefreshHandler can be used to refresh a token. The token still needs to be valid on refresh.
-// Shall be put under an endpoint that is using the ToukaJWTMiddleware.
-// Reply will be of the form {"token": "TOKEN"}.
 func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
-	tokenString, expire, err := mw.RefreshToken(c)
+	refreshToken := mw.extractRefreshToken(c)
+	if refreshToken == "" {
+		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingRefreshToken, c))
+		return
+	}
+	userData, err := mw.TokenStore.Get(c.Request.Context(), refreshToken)
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-
-	mw.RefreshResponse(c, http.StatusOK, tokenString, expire)
+	tokenPair, err := mw.TokenGenerator(c.Request.Context(), userData)
+	if err != nil {
+		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
+		return
+	}
+	_ = mw.TokenStore.Delete(c.Request.Context(), refreshToken)
+	mw.SetCookie(c, tokenPair.AccessToken)
+	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken)
+	mw.RefreshResponse(c, http.StatusOK, tokenPair)
 }
 
-// RefreshToken refresh token and check if token is expired
-func (mw *ToukaJWTMiddleware) RefreshToken(c *touka.Context) (string, time.Time, error) {
-	claims, err := mw.CheckIfTokenExpire(c)
-	if err != nil {
-		return "", time.Now(), err
-	}
-
-	// Create the token
-	newToken := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
-	newClaims := newToken.Claims.(jwt.MapClaims)
-
-	for key := range claims {
-		newClaims[key] = claims[key]
-	}
-
-	expire := mw.TimeFunc().Add(mw.TimeoutFunc(claims))
-	newClaims[mw.ExpField] = expire.Unix()
-	newClaims["orig_iat"] = mw.TimeFunc().Unix()
-	tokenString, err := mw.signedString(newToken)
-	if err != nil {
-		return "", time.Now(), err
-	}
-
-	mw.SetCookie(c, tokenString)
-
-	return tokenString, expire, nil
-}
-
-// CheckIfTokenExpire check if token expire
-func (mw *ToukaJWTMiddleware) CheckIfTokenExpire(c *touka.Context) (jwt.MapClaims, error) {
-	token, err := mw.ParseToken(c)
-	if err != nil {
-		// If we receive an error, and the error is anything other than a single
-		// ValidationErrorExpired, we want to return the error.
-		// If the error is just ValidationErrorExpired, we want to continue, as we can still
-		// refresh the token if it's within the MaxRefresh time.
-		// (see https://github.com/appleboy/gin-jwt/issues/176)
-		validationErr, ok := err.(*jwt.ValidationError)
-		if !ok || validationErr.Errors != jwt.ValidationErrorExpired {
-			return nil, err
-		}
-	}
-
-	claims := token.Claims.(jwt.MapClaims)
-
-	origIat := int64(claims["orig_iat"].(float64))
-
-	if origIat < mw.TimeFunc().Add(-mw.MaxRefresh).Unix() {
-		return nil, ErrExpiredToken
-	}
-
-	return claims, nil
-}
-
-// TokenGenerator method that clients can use to get a jwt token.
-func (mw *ToukaJWTMiddleware) TokenGenerator(data interface{}) (string, time.Time, error) {
+func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*core.Token, error) {
 	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
 	claims := token.Claims.(jwt.MapClaims)
-
 	if mw.PayloadFunc != nil {
-		for key, value := range mw.PayloadFunc(data) {
-			claims[key] = value
+		for k, v := range mw.PayloadFunc(data) {
+			claims[k] = v
 		}
 	}
-
-	expire := mw.TimeFunc().Add(mw.TimeoutFunc(claims))
+	expire := mw.TimeFunc().Add(mw.TimeoutFunc(data))
 	claims[mw.ExpField] = expire.Unix()
 	claims["orig_iat"] = mw.TimeFunc().Unix()
-	tokenString, err := mw.signedString(token)
+	accessToken, err := mw.signedString(token)
 	if err != nil {
-		return "", time.Time{}, err
+		return nil, err
 	}
 
-	return tokenString, expire, nil
+	refreshToken, err := mw.generateRefreshToken()
+	if err != nil {
+		return nil, err
+	}
+
+	err = mw.TokenStore.Set(ctx, refreshToken, data, mw.TimeFunc().Add(mw.RefreshTokenTimeout))
+	if err != nil {
+		return nil, err
+	}
+
+	return &core.Token{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresAt:    expire.Unix(),
+		CreatedAt:    mw.TimeFunc().Unix(),
+		TokenType:    "Bearer",
+	}, nil
 }
 
-func (mw *ToukaJWTMiddleware) jwtFromHeader(c *touka.Context, key string) (string, error) {
-	authHeader := c.Request.Header.Get(key)
-
-	if authHeader == "" {
-		return "", ErrEmptyAuthHeader
+func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
 	}
-
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || parts[0] != mw.TokenHeadName {
-		return "", ErrInvalidAuthHeader
-	}
-
-	return parts[1], nil
+	return base64.URLEncoding.EncodeToString(token), nil
 }
 
-func (mw *ToukaJWTMiddleware) jwtFromQuery(c *touka.Context, key string) (string, error) {
-	token := c.Query(key)
-
-	if token == "" {
-		return "", ErrEmptyQueryToken
+func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
+	if token, _ := c.GetCookie(mw.RefreshTokenCookieName); token != "" {
+		return token
 	}
-
-	return token, nil
+	if token := c.PostForm(mw.RefreshTokenCookieName); token != "" {
+		return token
+	}
+	if token := c.Query(mw.RefreshTokenCookieName); token != "" {
+		return token
+	}
+	return ""
 }
 
-func (mw *ToukaJWTMiddleware) jwtFromCookie(c *touka.Context, key string) (string, error) {
-	cookie, _ := c.GetCookie(key)
-
-	if cookie == "" {
-		return "", ErrEmptyCookieToken
+func (mw *ToukaJWTMiddleware) signedString(token *jwt.Token) (string, error) {
+	if mw.usingPublicKeyAlgo() {
+		return token.SignedString(mw.privKey)
 	}
-
-	return cookie, nil
+	return token.SignedString(mw.Key)
 }
 
-func (mw *ToukaJWTMiddleware) jwtFromParam(c *touka.Context, key string) (string, error) {
-	token := c.Param(key)
-
-	if token == "" {
-		return "", ErrEmptyParamToken
-	}
-
-	return token, nil
-}
-
-func (mw *ToukaJWTMiddleware) jwtFromForm(c *touka.Context, key string) (string, error) {
-	token := c.PostForm(key)
-
-	if token == "" {
-		return "", ErrEmptyParamToken
-	}
-
-	return token, nil
-}
-
-// ParseToken parse jwt token from gin context
 func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 	var token string
-	var err error
-
 	methods := strings.Split(mw.TokenLookup, ",")
 	for _, method := range methods {
 		if len(token) > 0 {
 			break
 		}
 		parts := strings.Split(strings.TrimSpace(method), ":")
-		k := strings.TrimSpace(parts[0])
-		v := strings.TrimSpace(parts[1])
+		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		switch k {
 		case "header":
-			token, err = mw.jwtFromHeader(c, v)
+			token = mw.jwtFromHeader(c, v)
 		case "query":
-			token, err = mw.jwtFromQuery(c, v)
+			token = c.Query(v)
 		case "cookie":
-			token, err = mw.jwtFromCookie(c, v)
+			token, _ = c.GetCookie(v)
 		case "param":
-			token, err = mw.jwtFromParam(c, v)
+			token = c.Param(v)
 		case "form":
-			token, err = mw.jwtFromForm(c, v)
+			token = c.PostForm(v)
 		}
 	}
-
-	if err != nil {
-		return nil, err
+	if token == "" {
+		return nil, ErrEmptyAuthHeader
 	}
-
-	if mw.KeyFunc != nil {
-		return jwt.Parse(token, mw.KeyFunc, mw.ParseOptions...)
-	}
-
-	return jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+	return jwt.Parse(token, func(t *jwt.Token) (any, error) {
 		if jwt.GetSigningMethod(mw.SigningAlgorithm) != t.Method {
 			return nil, ErrInvalidSigningAlgorithm
 		}
 		if mw.usingPublicKeyAlgo() {
 			return mw.pubKey, nil
 		}
-
-		// save token string if valid
 		c.Set("JWT_TOKEN", token)
-
 		return mw.Key, nil
 	}, mw.ParseOptions...)
 }
 
-// ParseTokenString parse jwt token string
-func (mw *ToukaJWTMiddleware) ParseTokenString(token string) (*jwt.Token, error) {
-	if mw.KeyFunc != nil {
-		return jwt.Parse(token, mw.KeyFunc, mw.ParseOptions...)
+func (mw *ToukaJWTMiddleware) jwtFromHeader(c *touka.Context, key string) string {
+	authHeader := c.Request.Header.Get(key)
+	if authHeader == "" {
+		return ""
 	}
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != mw.TokenHeadName {
+		return ""
+	}
+	return parts[1]
+}
 
-	return jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
-		if jwt.GetSigningMethod(mw.SigningAlgorithm) != t.Method {
-			return nil, ErrInvalidSigningAlgorithm
-		}
-		if mw.usingPublicKeyAlgo() {
-			return mw.pubKey, nil
-		}
-
-		return mw.Key, nil
-	}, mw.ParseOptions...)
+func (mw *ToukaJWTMiddleware) handleTokenError(c *touka.Context, err error) {
+	switch {
+	case errors.Is(err, jwt.ErrTokenExpired):
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrExpiredToken, c))
+	default:
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
+	}
 }
 
 func (mw *ToukaJWTMiddleware) unauthorized(c *touka.Context, code int, message string) {
-	c.SetHeader("WWW-Authenticate", "JWT realm="+mw.Realm)
+	c.SetHeader("WWW-Authenticate", "Bearer realm=\""+mw.Realm+"\"")
 	if !mw.DisabledAbort {
 		c.Abort()
 	}
-
 	mw.Unauthorized(c, code, message)
 }
 
-// ExtractClaims help to extract the JWT claims
-func ExtractClaims(c *touka.Context) MapClaims {
+func (mw *ToukaJWTMiddleware) SetCookie(c *touka.Context, token string) {
+	if mw.SendCookie {
+		maxage := int(mw.Timeout.Seconds())
+		c.SetCookie(mw.CookieName, token, maxage, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
+	}
+}
+
+func (mw *ToukaJWTMiddleware) SetRefreshTokenCookie(c *touka.Context, token string) {
+	if mw.SendCookie {
+		maxage := int(mw.RefreshTokenTimeout.Seconds())
+		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, true, true)
+	}
+}
+
+func ExtractClaims(c *touka.Context) jwt.MapClaims {
 	claims, exists := c.Get("JWT_PAYLOAD")
 	if !exists {
-		return make(MapClaims)
+		return make(jwt.MapClaims)
 	}
-
-	return claims.(MapClaims)
+	return claims.(jwt.MapClaims)
 }
 
-// ExtractClaimsFromToken help to extract the JWT claims from token
-func ExtractClaimsFromToken(token *jwt.Token) MapClaims {
+func ExtractClaimsFromToken(token *jwt.Token) jwt.MapClaims {
 	if token == nil {
-		return make(MapClaims)
+		return make(jwt.MapClaims)
 	}
-
-	claims := MapClaims{}
-	for key, value := range token.Claims.(jwt.MapClaims) {
-		claims[key] = value
-	}
-
-	return claims
+	return token.Claims.(jwt.MapClaims)
 }
 
-// GetToken help to get the JWT token string
 func GetToken(c *touka.Context) string {
 	token, exists := c.Get("JWT_TOKEN")
 	if !exists {
 		return ""
 	}
-
 	return token.(string)
-}
-
-// SetCookie help to set the token in the cookie
-func (mw *ToukaJWTMiddleware) SetCookie(c *touka.Context, token string) {
-	// set cookie
-	if mw.SendCookie {
-		expireCookie := mw.TimeFunc().Add(mw.CookieMaxAge)
-		maxage := int(expireCookie.Unix() - mw.TimeFunc().Unix())
-
-		if mw.CookieSameSite != 0 {
-			c.SetSameSite(mw.CookieSameSite)
-		}
-
-		c.SetCookie(
-			mw.CookieName,
-			token,
-			maxage,
-			"/",
-			mw.CookieDomain,
-			mw.SecureCookie,
-			mw.CookieHTTPOnly,
-		)
-	}
 }

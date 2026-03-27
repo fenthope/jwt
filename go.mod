@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/appleboy/gofight/v2 v2.2.1
-	github.com/golang-jwt/jwt/v4 v4.5.2
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/infinite-iroha/touka v0.4.2
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.18.0
