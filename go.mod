@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/appleboy/gofight/v2 v2.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/infinite-iroha/touka v0.4.2
+	github.com/infinite-iroha/touka v0.5.1-0.20260329175043-8dc7d8c136f2
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.18.0
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
@@ -13,19 +13,21 @@ require (
 
 require (
 	github.com/WJQSERVER-STUDIO/go-utils/iox v0.0.2 // indirect
-	github.com/WJQSERVER-STUDIO/httpc v0.8.2 // indirect
-	github.com/WJQSERVER/wanf v0.0.6 // indirect
+	github.com/WJQSERVER-STUDIO/httpc v0.9.0 // indirect
+	github.com/WJQSERVER/wanf v0.0.8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/fenthope/reco v0.0.4 // indirect
-	github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e // indirect
+	github.com/fenthope/reco v0.0.5 // indirect
+	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.8.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/crypto v0.49.0 // indirect
+	golang.org/x/net v0.52.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/infinite-iroha/touka => github.com/infinite-iroha/touka v0.5.1-0.20260329175043-8dc7d8c136f2

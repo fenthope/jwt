@@ -58,6 +58,7 @@ type ToukaJWTMiddleware struct {
 
 	RefreshTokenSecureCookie   bool
 	RefreshTokenCookieHTTPOnly bool
+	RefreshTokenCookieSameSite http.SameSite
 
 	PayloadFunc       func(data any) MapClaims
 	IdentityHandler   func(c *touka.Context) any
@@ -477,6 +478,9 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 		if jwt.GetSigningMethod(mw.SigningAlgorithm) != t.Method {
 			return nil, ErrInvalidSigningAlgorithm
 		}
+		if mw.KeyFunc != nil {
+			return mw.KeyFunc(t)
+		}
 		if mw.usingPublicKeyAlgo() {
 			return mw.pubKey, nil
 		}
@@ -517,14 +521,17 @@ func (mw *ToukaJWTMiddleware) unauthorized(c *touka.Context, code int, message s
 func (mw *ToukaJWTMiddleware) SetCookie(c *touka.Context, token string) {
 	if mw.SendCookie {
 		maxage := int(mw.Timeout.Seconds())
-		c.SetCookie(mw.CookieName, token, maxage, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
+		if mw.CookieMaxAge > 0 {
+			maxage = int(mw.CookieMaxAge.Seconds())
+		}
+		c.SetCookie(mw.CookieName, token, maxage, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly, mw.CookieSameSite)
 	}
 }
 
 func (mw *ToukaJWTMiddleware) SetRefreshTokenCookie(c *touka.Context, token string) {
 	if mw.SendCookie {
 		maxage := int(mw.RefreshTokenTimeout.Seconds())
-		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
+		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly, mw.RefreshTokenCookieSameSite)
 	}
 }
 
