@@ -56,6 +56,9 @@ type ToukaJWTMiddleware struct {
 
 	RefreshTokenCookieName string
 
+	RefreshTokenSecureCookie   bool
+	RefreshTokenCookieHTTPOnly bool
+
 	PayloadFunc       func(data any) MapClaims
 	IdentityHandler   func(c *touka.Context) any
 	ParseOptions      []jwt.ParserOption
@@ -136,6 +139,9 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	if mw.RefreshTokenCookieName == "" {
 		mw.RefreshTokenCookieName = "refresh_token"
 	}
+	// Refresh token cookie security defaults to true for enhanced security
+	mw.RefreshTokenSecureCookie = true
+	mw.RefreshTokenCookieHTTPOnly = true
 	if mw.RefreshTokenTimeout == 0 {
 		if mw.MaxRefresh != 0 {
 			mw.RefreshTokenTimeout = mw.MaxRefresh
@@ -370,7 +376,10 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	_ = mw.TokenStore.Delete(c.Request.Context(), refreshToken)
+	if err := mw.TokenStore.Delete(c.Request.Context(), refreshToken); err != nil {
+		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
+		return
+	}
 	mw.SetCookie(c, tokenPair.AccessToken)
 	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken)
 	mw.RefreshResponse(c, http.StatusOK, tokenPair)
@@ -482,7 +491,7 @@ func (mw *ToukaJWTMiddleware) jwtFromHeader(c *touka.Context, key string) string
 		return ""
 	}
 	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || parts[0] != mw.TokenHeadName {
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) != strings.TrimSpace(mw.TokenHeadName) {
 		return ""
 	}
 	return parts[1]
@@ -515,7 +524,7 @@ func (mw *ToukaJWTMiddleware) SetCookie(c *touka.Context, token string) {
 func (mw *ToukaJWTMiddleware) SetRefreshTokenCookie(c *touka.Context, token string) {
 	if mw.SendCookie {
 		maxage := int(mw.RefreshTokenTimeout.Seconds())
-		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, true, true)
+		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
 	}
 }
 

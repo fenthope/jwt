@@ -48,8 +48,14 @@ func (s *InMemoryRefreshTokenStore) Get(ctx context.Context, token string) (any,
 	}
 	if data.IsExpired() {
 		s.mu.Lock()
-		delete(s.tokens, token)
+		// Double-check after acquiring write lock
+		if data, exists := s.tokens[token]; exists && data.IsExpired() {
+			delete(s.tokens, token)
+			s.mu.Unlock()
+			return nil, core.ErrRefreshTokenNotFound
+		}
 		s.mu.Unlock()
+		// Token was already deleted or refreshed by another goroutine
 		return nil, core.ErrRefreshTokenNotFound
 	}
 	return data.UserData, nil
