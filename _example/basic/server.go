@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fenthope/jwt"
+	"github.com/fenthope/jwt/core"
 	"github.com/infinite-iroha/touka"
 )
 
@@ -20,7 +21,6 @@ var (
 	port        string
 )
 
-// User demo
 type User struct {
 	UserName  string
 	FirstName string
@@ -36,19 +36,13 @@ func init() {
 
 func main() {
 	engine := touka.Default()
-	// the jwt middleware
 	authMiddleware, err := jwt.New(initParams())
 	if err != nil {
 		log.Fatal("JWT Error:" + err.Error())
 	}
 
-	// register middleware
-	engine.Use(handlerMiddleWare(authMiddleware))
-
-	// register route
 	registerRoute(engine, authMiddleware)
 
-	// start http server
 	if err = http.ListenAndServe(":"+port, engine); err != nil {
 		log.Fatal(err)
 	}
@@ -56,20 +50,10 @@ func main() {
 
 func registerRoute(r *touka.Engine, handle *jwt.ToukaJWTMiddleware) {
 	r.POST("/login", handle.LoginHandler)
-	r.NoRoutes(handle.MiddlewareFunc(), handleNoRoute())
+	r.GET("/refresh_token", handle.RefreshHandler)
 
 	auth := r.Group("/auth", handle.MiddlewareFunc())
-	auth.GET("/refresh_token", handle.RefreshHandler)
 	auth.GET("/hello", helloHandler)
-}
-
-func handlerMiddleWare(authMiddleware *jwt.ToukaJWTMiddleware) touka.HandlerFunc {
-	return func(context *touka.Context) {
-		errInit := authMiddleware.MiddlewareInit()
-		if errInit != nil {
-			log.Fatal("authMiddleware.MiddlewareInit() Error:" + errInit.Error())
-		}
-	}
 }
 
 func initParams() *jwt.ToukaJWTMiddleware {
@@ -77,7 +61,7 @@ func initParams() *jwt.ToukaJWTMiddleware {
 		Realm:       "test zone",
 		Key:         []byte("secret key"),
 		Timeout:     time.Hour,
-		MaxRefresh:  time.Hour,
+		MaxRefresh:  time.Hour * 24 * 7,
 		IdentityKey: identityKey,
 		PayloadFunc: payloadFunc(),
 
@@ -86,15 +70,13 @@ func initParams() *jwt.ToukaJWTMiddleware {
 		Authorizator:    authorizator(),
 		Unauthorized:    unauthorized(),
 		TokenLookup:     "header: Authorization, query: token, cookie: jwt",
-		// TokenLookup: "query:token",
-		// TokenLookup: "cookie:token",
-		TokenHeadName: "Bearer",
-		TimeFunc:      time.Now,
+		TokenHeadName:   "Bearer",
+		TimeFunc:        time.Now,
 	}
 }
 
-func payloadFunc() func(data interface{}) jwt.MapClaims {
-	return func(data interface{}) jwt.MapClaims {
+func payloadFunc() func(data any) jwt.MapClaims {
+	return func(data any) jwt.MapClaims {
 		if v, ok := data.(*User); ok {
 			return jwt.MapClaims{
 				identityKey: v.UserName,
@@ -104,8 +86,8 @@ func payloadFunc() func(data interface{}) jwt.MapClaims {
 	}
 }
 
-func identityHandler() func(c *touka.Context) interface{} {
-	return func(c *touka.Context) interface{} {
+func identityHandler() func(c *touka.Context) any {
+	return func(c *touka.Context) any {
 		claims := jwt.ExtractClaims(c)
 		return &User{
 			UserName: claims[identityKey].(string),
@@ -113,8 +95,8 @@ func identityHandler() func(c *touka.Context) interface{} {
 	}
 }
 
-func authenticator() func(c *touka.Context) (interface{}, error) {
-	return func(c *touka.Context) (interface{}, error) {
+func authenticator() func(c *touka.Context) (any, error) {
+	return func(c *touka.Context) (any, error) {
 		var loginVals login
 		if err := c.ShouldBind(&loginVals); err != nil {
 			return "", jwt.ErrMissingLoginValues
@@ -133,8 +115,8 @@ func authenticator() func(c *touka.Context) (interface{}, error) {
 	}
 }
 
-func authorizator() func(data interface{}, c *touka.Context) bool {
-	return func(data interface{}, c *touka.Context) bool {
+func authorizator() func(data any, c *touka.Context) bool {
+	return func(data any, c *touka.Context) bool {
 		if v, ok := data.(*User); ok && v.UserName == "admin" {
 			return true
 		}
@@ -148,14 +130,6 @@ func unauthorized() func(c *touka.Context, code int, message string) {
 			"code":    code,
 			"message": message,
 		})
-	}
-}
-
-func handleNoRoute() func(c *touka.Context) {
-	return func(c *touka.Context) {
-		claims := jwt.ExtractClaims(c)
-		log.Printf("NoRoute claims: %#v\n", claims)
-		c.JSON(404, touka.H{"code": "PAGE_NOT_FOUND", "message": "Page not found"})
 	}
 }
 
