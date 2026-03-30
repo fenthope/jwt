@@ -150,26 +150,6 @@ func (s *InMemoryRefreshTokenStore) Get(ctx context.Context, token string) (any,
 	return data.UserData, nil
 }
 
-func (s *InMemoryRefreshTokenStore) Consume(ctx context.Context, token string) (any, error) {
-	if token == "" {
-		return nil, core.ErrRefreshTokenNotFound
-	}
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.purgeExpiredLocked(now)
-	data, exists := s.tokens[token]
-	if !exists {
-		return nil, core.ErrRefreshTokenNotFound
-	}
-	if now.After(data.Expiry) {
-		s.deleteLocked(token)
-		return nil, core.ErrRefreshTokenExpired
-	}
-	s.deleteLocked(token)
-	return data.UserData, nil
-}
-
 func (s *InMemoryRefreshTokenStore) Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error {
 	if oldToken == "" {
 		return core.ErrRefreshTokenNotFound
@@ -190,7 +170,9 @@ func (s *InMemoryRefreshTokenStore) Rotate(ctx context.Context, oldToken, newTok
 		return core.ErrRefreshTokenExpired
 	}
 	s.setLocked(newToken, userData, expiry, now)
-	s.deleteLocked(oldToken)
+	if oldToken != newToken {
+		s.deleteLocked(oldToken)
+	}
 	return nil
 }
 

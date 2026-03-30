@@ -348,6 +348,23 @@ func TestRefreshTokenRotateSucceedsOnceInMemoryStore(t *testing.T) {
 	assert.Equal(t, 1, notFoundCount)
 }
 
+func TestRefreshTokenRotateSupportsSameOldAndNewToken(t *testing.T) {
+	s := store.NewInMemoryRefreshTokenStore()
+	err := s.Set(context.Background(), "refresh-token", "admin", time.Now().Add(time.Hour))
+	require.NoError(t, err)
+
+	err = s.Rotate(context.Background(), "refresh-token", "refresh-token", "admin", time.Now().Add(2*time.Hour))
+	require.NoError(t, err)
+
+	userData, err := s.Get(context.Background(), "refresh-token")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", userData)
+
+	count, err := s.Count(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
 func TestInMemoryRefreshTokenStoreCountPurgesExpiredTokens(t *testing.T) {
 	s := store.NewInMemoryRefreshTokenStore()
 	err := s.Set(context.Background(), "expired-token", "admin", time.Now().Add(-time.Second))
