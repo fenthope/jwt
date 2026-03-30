@@ -6,7 +6,6 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -86,6 +85,7 @@ var (
 	ErrMissingAuthenticatorFunc = errors.New("authenticator function is missing")
 	ErrMissingExpField          = errors.New("missing exp field")
 	ErrWrongFormatOfExp         = errors.New("wrong format of exp field")
+	ErrInvalidToken             = errors.New("invalid token")
 	ErrInvalidSigningAlgorithm  = errors.New("invalid signing algorithm")
 	ErrNoPrivKeyFile            = errors.New("private key file is missing")
 	ErrNoPubKeyFile             = errors.New("public key file is missing")
@@ -103,10 +103,6 @@ var (
 	ErrTokenNotValidYet         = errors.New("token is not valid yet")
 	ErrMissingRefreshToken      = errors.New("refresh token is missing")
 )
-
-type refreshTokenConsumer interface {
-	Consume(ctx context.Context, token string) (any, error)
-}
 
 type refreshTokenRotator interface {
 	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
@@ -524,7 +520,6 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 		if mw.KeyFunc != nil {
 			return mw.KeyFunc(t)
 		}
-		c.Set("JWT_TOKEN", token)
 		if mw.usingPublicKeyAlgo() {
 			return mw.pubKey, nil
 		}
@@ -534,8 +529,9 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 		return nil, err
 	}
 	if !parsedToken.Valid {
-		return nil, fmt.Errorf("invalid token")
+		return nil, ErrInvalidToken
 	}
+	c.Set("JWT_TOKEN", token)
 	return parsedToken, nil
 }
 

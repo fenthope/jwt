@@ -291,6 +291,31 @@ func TestMiddlewareRejectsTokenNotValidYet(t *testing.T) {
 		})
 }
 
+func TestParseTokenDoesNotSetContextTokenForInvalidSignature(t *testing.T) {
+	auth, err := New(&ToukaJWTMiddleware{
+		Realm: "test",
+		Key:   key,
+	})
+	require.NoError(t, err)
+
+	wrongKeyToken := jwt.New(jwt.SigningMethodHS256)
+	claims := wrongKeyToken.Claims.(jwt.MapClaims)
+	claims["identity"] = "admin"
+	claims["exp"] = time.Now().Add(time.Hour).Unix()
+	signed, err := wrongKeyToken.SignedString([]byte("wrong-secret"))
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodGet, "/auth/hello", nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	c.Request = req
+
+	_, err = auth.ParseToken(c)
+	require.Error(t, err)
+	assert.Empty(t, GetToken(c))
+}
+
 func TestRefreshTokenRotateSucceedsOnceInMemoryStore(t *testing.T) {
 	s := store.NewInMemoryRefreshTokenStore()
 	err := s.Set(context.Background(), "refresh-token", "admin", time.Now().Add(time.Hour))
@@ -321,6 +346,26 @@ func TestRefreshTokenRotateSucceedsOnceInMemoryStore(t *testing.T) {
 	}
 	assert.Equal(t, 1, okCount)
 	assert.Equal(t, 1, notFoundCount)
+}
+
+func TestInMemoryRefreshTokenStoreCountPurgesExpiredTokens(t *testing.T) {
+	s := store.NewInMemoryRefreshTokenStore()
+	err := s.Set(context.Background(), "expired-token", "admin", time.Now().Add(-time.Second))
+	require.NoError(t, err)
+	err = s.Set(context.Background(), "active-token", "admin", time.Now().Add(time.Hour))
+	require.NoError(t, err)
+
+	count, err := s.Count(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	_, err = s.Get(context.Background(), "expired-token")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, store.ErrRefreshTokenNotFound) || errors.Is(err, store.ErrRefreshTokenExpired))
+
+	userData, err := s.Get(context.Background(), "active-token")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", userData)
 }
 
 func TestRefreshHandlerPreservesOldTokenWhenRotationFails(t *testing.T) {
