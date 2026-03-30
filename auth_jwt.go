@@ -391,10 +391,11 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
+	refreshExpiry := time.Unix(tokenPair.CreatedAt, 0).Add(mw.RefreshTokenTimeout)
 	if rotator, ok := mw.TokenStore.(refreshTokenRotator); ok {
-		err = rotator.Rotate(ctx, refreshToken, tokenPair.RefreshToken, userData, time.Unix(tokenPair.CreatedAt, 0).Add(mw.RefreshTokenTimeout))
+		err = rotator.Rotate(ctx, refreshToken, tokenPair.RefreshToken, userData, refreshExpiry)
 	} else {
-		err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, userData, time.Unix(tokenPair.CreatedAt, 0).Add(mw.RefreshTokenTimeout))
+		err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, userData, refreshExpiry)
 		if err == nil {
 			err = mw.TokenStore.Delete(ctx, refreshToken)
 			if err != nil {
