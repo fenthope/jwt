@@ -332,7 +332,7 @@ After having successfully authenticated with `Authenticator`, created the jwt to
 
 PROVIDED: `MiddlewareFunc`
 
-This is gin middleware that should be used within any endpoints that require the jwt token to be present. This middleware will parse the request headers for the token if it exists, and check that the jwt token is valid (not expired, correct signature). Then it will call `IdentityHandler` followed by `Authorizator`. If `Authorizator` passes and all of the previous token validity checks passed, the middleware will continue the request. If any of these checks fail, the `Unauthorized` function is used (explained below).
+This is gin middleware that should be used within any endpoints that require the jwt token to be present. This middleware will parse the request headers for the token if it exists, and check that the jwt token is valid (expected signing method, correct signature, and valid time-based claims such as `exp` and `nbf`). Then it will call `IdentityHandler` followed by `Authorizator`. If `Authorizator` passes and all of the previous token validity checks passed, the middleware will continue the request. If any of these checks fail, the `Unauthorized` function is used (explained below).
 
 OPTIONAL: `IdentityHandler`
 
@@ -356,7 +356,7 @@ This should likely just return back to the user the http status code, if logout 
 
 PROVIDED: `RefreshHandler`:
 
-This is a provided function to be called on any refresh token endpoint. If the token passed in is was issued within the `MaxRefreshTime` time frame, then this handler will create/set a new token similar to the `LoginHandler`, and pass this token into `RefreshResponse`
+This is a provided function to be called on any refresh token endpoint. If the refresh token exists in the configured `TokenStore` and has not expired, this handler will consume it, mint a fresh access token and refresh token pair, and pass the new pair into `RefreshResponse`. Refresh tokens are single-use when the in-memory store is used.
 
 OPTIONAL: `RefreshResponse`:
 

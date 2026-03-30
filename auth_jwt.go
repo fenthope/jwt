@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -99,8 +100,17 @@ var (
 	ErrMissingLoginValues       = errors.New("missing Username or Password")
 	ErrFailedTokenCreation      = errors.New("failed to create token")
 	ErrExpiredToken             = errors.New("token is expired")
+	ErrTokenNotValidYet         = errors.New("token is not valid yet")
 	ErrMissingRefreshToken      = errors.New("refresh token is missing")
 )
+
+type refreshTokenConsumer interface {
+	Consume(ctx context.Context, token string) (any, error)
+}
+
+type refreshTokenRotator interface {
+	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+}
 
 func New(mw *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error) {
 	if err := mw.MiddlewareInit(); err != nil {
@@ -140,9 +150,12 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	if mw.RefreshTokenCookieName == "" {
 		mw.RefreshTokenCookieName = "refresh_token"
 	}
-	// Refresh token cookie security defaults to true for enhanced security
-	mw.RefreshTokenSecureCookie = true
-	mw.RefreshTokenCookieHTTPOnly = true
+	if !mw.RefreshTokenSecureCookie {
+		mw.RefreshTokenSecureCookie = mw.SecureCookie
+	}
+	if !mw.RefreshTokenCookieHTTPOnly {
+		mw.RefreshTokenCookieHTTPOnly = mw.CookieHTTPOnly
+	}
 	if mw.RefreshTokenTimeout == 0 {
 		if mw.MaxRefresh != 0 {
 			mw.RefreshTokenTimeout = mw.MaxRefresh
@@ -367,17 +380,33 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingRefreshToken, c))
 		return
 	}
-	userData, err := mw.TokenStore.Get(c.Request.Context(), refreshToken)
+	ctx := c.Request.Context()
+	var (
+		userData any
+		err      error
+	)
+	userData, err = mw.TokenStore.Get(ctx, refreshToken)
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	tokenPair, err := mw.TokenGenerator(c.Request.Context(), userData)
+	tokenPair, err := mw.generateTokenPair(ctx, userData, false)
 	if err != nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	if err := mw.TokenStore.Delete(c.Request.Context(), refreshToken); err != nil {
+	if rotator, ok := mw.TokenStore.(refreshTokenRotator); ok {
+		err = rotator.Rotate(ctx, refreshToken, tokenPair.RefreshToken, userData, time.Unix(tokenPair.CreatedAt, 0).Add(mw.RefreshTokenTimeout))
+	} else {
+		err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, userData, time.Unix(tokenPair.CreatedAt, 0).Add(mw.RefreshTokenTimeout))
+		if err == nil {
+			err = mw.TokenStore.Delete(ctx, refreshToken)
+			if err != nil {
+				_ = mw.TokenStore.Delete(ctx, tokenPair.RefreshToken)
+			}
+		}
+	}
+	if err != nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
@@ -387,16 +416,23 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 }
 
 func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*core.Token, error) {
+	return mw.generateTokenPair(ctx, data, true)
+}
+
+func (mw *ToukaJWTMiddleware) generateTokenPair(ctx context.Context, data any, persistRefreshToken bool) (*core.Token, error) {
 	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
+	token.Header["typ"] = "JWT"
 	claims := token.Claims.(jwt.MapClaims)
 	if mw.PayloadFunc != nil {
 		for k, v := range mw.PayloadFunc(data) {
 			claims[k] = v
 		}
 	}
-	expire := mw.TimeFunc().Add(mw.TimeoutFunc(data))
+	now := mw.TimeFunc()
+	expire := now.Add(mw.TimeoutFunc(data))
 	claims[mw.ExpField] = expire.Unix()
-	claims["orig_iat"] = mw.TimeFunc().Unix()
+	claims["iat"] = now.Unix()
+	claims["orig_iat"] = now.Unix()
 	accessToken, err := mw.signedString(token)
 	if err != nil {
 		return nil, err
@@ -407,16 +443,19 @@ func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*co
 		return nil, err
 	}
 
-	err = mw.TokenStore.Set(ctx, refreshToken, data, mw.TimeFunc().Add(mw.RefreshTokenTimeout))
-	if err != nil {
-		return nil, err
+	refreshExpiry := now.Add(mw.RefreshTokenTimeout)
+	if persistRefreshToken {
+		err = mw.TokenStore.Set(ctx, refreshToken, data, refreshExpiry)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &core.Token{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresAt:    expire.Unix(),
-		CreatedAt:    mw.TimeFunc().Unix(),
+		CreatedAt:    now.Unix(),
 		TokenType:    "Bearer",
 	}, nil
 }
@@ -426,7 +465,7 @@ func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
 	if _, err := rand.Read(token); err != nil {
 		return "", err
 	}
-	return base64.URLEncoding.EncodeToString(token), nil
+	return base64.RawURLEncoding.EncodeToString(token), nil
 }
 
 func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
@@ -457,6 +496,9 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 			break
 		}
 		parts := strings.Split(strings.TrimSpace(method), ":")
+		if len(parts) != 2 {
+			continue
+		}
 		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		switch k {
 		case "header":
@@ -474,19 +516,38 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 	if token == "" {
 		return nil, ErrEmptyAuthHeader
 	}
-	return jwt.Parse(token, func(t *jwt.Token) (any, error) {
+	parseOptions := mw.buildParseOptions()
+	parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
 		if jwt.GetSigningMethod(mw.SigningAlgorithm) != t.Method {
 			return nil, ErrInvalidSigningAlgorithm
 		}
 		if mw.KeyFunc != nil {
 			return mw.KeyFunc(t)
 		}
+		c.Set("JWT_TOKEN", token)
 		if mw.usingPublicKeyAlgo() {
 			return mw.pubKey, nil
 		}
-		c.Set("JWT_TOKEN", token)
 		return mw.Key, nil
-	}, mw.ParseOptions...)
+	}, parseOptions...)
+	if err != nil {
+		return nil, err
+	}
+	if !parsedToken.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+	return parsedToken, nil
+}
+
+func (mw *ToukaJWTMiddleware) buildParseOptions() []jwt.ParserOption {
+	baseOptions := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{mw.SigningAlgorithm}),
+		jwt.WithTimeFunc(mw.TimeFunc),
+	}
+	if mw.ExpField == "exp" {
+		baseOptions = append(baseOptions, jwt.WithExpirationRequired())
+	}
+	return append(baseOptions, mw.ParseOptions...)
 }
 
 func (mw *ToukaJWTMiddleware) jwtFromHeader(c *touka.Context, key string) string {
@@ -505,6 +566,8 @@ func (mw *ToukaJWTMiddleware) handleTokenError(c *touka.Context, err error) {
 	switch {
 	case errors.Is(err, jwt.ErrTokenExpired):
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrExpiredToken, c))
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrTokenNotValidYet, c))
 	default:
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 	}
