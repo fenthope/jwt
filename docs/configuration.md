@@ -23,29 +23,29 @@
 | `LoginResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 返回 `{"code": <code>, "access_token": <token>, "refresh_token": <token>, "expire": <RFC3339>}` | 否 | 登录成功后的响应处理函数 |
 | `LogoutResponse` | `func(c *touka.Context, code int)` | JSON 返回 `{"code": <code>}` | 否 | 登出成功后的响应处理函数 |
 | `RefreshResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 返回 `{"code": <code>, "access_token": <token>, "refresh_token": <token>, "expire": <RFC3339>}` | 否 | Token 刷新成功后的响应处理函数 |
-| `HTTPStatusMessageFunc` | `func(e error, c *touka.Context) string` | 返回 `e.Error()` | 否 | 将错误转换为 HTTP 响应消息的函数 |
+| `HTTPStatusMessageFunc` | `func(e error, c *touka.Context) string` | `e == nil` 时返回空字符串，否则返回 `e.Error()` | 否 | 将错误转换为 HTTP 响应消息的函数 |
 | `TokenLookup` | `string` | `"header:Authorization"` | 否 | Access Token 提取位置。格式为 `"source:key"`，多个源用逗号分隔。source 可选：`header`、`query`、`cookie`、`param`、`form` |
 | `TokenHeadName` | `string` | `"Bearer"` | 否 | Authorization Header 前缀名。用于从 Header 提取 Token 时匹配前缀 |
-| `TimeFunc` | `func() time.Time` | `time.Now` | 否 | 获取当前时间的函数。用于 Token 签发和过期计算 |
-| `ExpField` | `string` | `"exp"` | 否 | Token 过期时间戳在 Claims 中的字段名 |
+| `TimeFunc` | `func() time.Time` | `time.Now` | 否 | 获取当前时间的函数。用于 Access/Refresh Token 签发、过期校验、JWT 解析时的时间判断；默认内存 `TokenStore` 使用它作为存储时钟 |
+| `ExpField` | `string` | `"exp"` | 否 | Access Token 过期时间戳在 Claims 中的字段名。生成 Token 时写入该字段，鉴权时也从该字段读取并校验 |
 | `SendCookie` | `bool` | `false` | 否 | 是否将 Access Token 和 Refresh Token 写入 Cookie |
 | `CookieName` | `string` | `"jwt"` | 否 | Access Token Cookie 名称 |
-| `CookieMaxAge` | `time.Duration` | 无 | 否 | Cookie 最大存活时间。优先使用 `CookieMaxAge`；若未设置或 `<=0`，则回退到 `Timeout` |
+| `CookieMaxAge` | `time.Duration` | 无 | 否 | Access Token Cookie 最大存活时间。LoginHandler/RefreshHandler 通过 `setAccessTokenCookie` 写入时：若 `>0` 则使用该值；否则使用 Access Token 剩余有效期。直接调用 `SetCookie` 写入时：若 `>0` 则使用该值；否则回退到 `Timeout` |
 | `CookieDomain` | `string` | 空字符串 | 否 | Cookie 所属域名 |
 | `SecureCookie` | `bool` | `false` | 否 | Access Token Cookie 是否仅通过 HTTPS 发送 |
 | `CookieHTTPOnly` | `bool` | `false` | 否 | Access Token Cookie 是否禁止 JavaScript 访问 |
 | `CookieSameSite` | `http.SameSite` | `0`（`http.SameSiteDefaultMode`） | 否 | Cookie 的 SameSite 属性。`0` 时框架不设置该属性 |
 | `RefreshTokenCookieName` | `string` | `"refresh_token"` | 否 | Refresh Token Cookie 名称 |
-| `RefreshTokenSecureCookie` | `bool` | `false`（`SendCookie=true` 时为 `true`） | 否 | Refresh Token Cookie 是否仅通过 HTTPS 发送 |
-| `RefreshTokenCookieHTTPOnly` | `bool` | `false`（`SendCookie=true` 时为 `true`） | 否 | Refresh Token Cookie 是否禁止 JavaScript 访问 |
+| `RefreshTokenSecureCookie` | `bool` | `false`（但 `SendCookie=true` 时会被 `MiddlewareInit` 强制设为 `true`） | 否 | Refresh Token Cookie 是否仅通过 HTTPS 发送 |
+| `RefreshTokenCookieHTTPOnly` | `bool` | `false`（但 `SendCookie=true` 时会被 `MiddlewareInit` 强制设为 `true`） | 否 | Refresh Token Cookie 是否禁止 JavaScript 访问 |
 | `PrivKeyFile` | `string` | 无 | 否 | 算法签名密钥文件路径。文件内容为算法所需的原始字节（`ML-DSA-65` 为 32 字节 seed） |
 | `PrivKeyBytes` | `[]byte` | 无 | 否 | 算法签名密钥字节数组。与 `PrivKeyFile` 二选一 |
 | `PubKeyFile` | `string` | 无 | 否 | 算法验签公钥文件路径。文件内容为算法所需的原始字节（`ML-DSA-65` 为 `mldsa.PublicKey.Bytes()` 输出） |
 | `PubKeyBytes` | `[]byte` | 无 | 否 | 算法验签公钥字节数组。与 `PubKeyFile` 二选一 |
 | `ParseOptions` | `[]jwt.ParserOption` | 无 | 否 | JWT 解析选项，透传给 `jwt.Parse` |
-| `SendAuthorization` | `bool` | `false` | 否 | 是否在响应 Header 中回传 Authorization 头 |
+| `SendAuthorization` | `bool` | `false` | 否 | 是否在成功解析请求中的 Access Token 后，于响应 Header 中回传 `Authorization: <TokenHeadName> <token>` |
 | `TokenStore` | `core.TokenStore` | 内存存储 (`InMemoryRefreshTokenStore`) | 否 | Refresh Token 存储接口实现。若要支持 `RefreshHandler`，store 必须实现 `core.RefreshTokenRotator` |
-| `DisabledAbort` | `bool` | `false` | 否 | 认证失败后是否阻止后续 Handler 执行。`true` 时不调用 `c.Abort()` |
+| `DisabledAbort` | `bool` | `false` | 否 | 认证失败后是否阻止后续 Handler 执行。默认会先调用 `c.Abort()` 再执行 `Unauthorized`；设为 `true` 时仅执行 `Unauthorized` |
 
 ## 密钥配置说明
 
@@ -63,10 +63,17 @@
 
 ### 密钥优先级
 
-1. `Key`（最高优先）
-2. `PrivKeyBytes` / `PubKeyBytes`
-3. `PrivKeyFile` / `PubKeyFile`
-4. 从 `Key` 派生（仅公钥）
+签名私钥加载优先级：
+
+1. `Key`（已直接提供签名密钥对象）
+2. `PrivKeyFile`（有文件路径时从文件加载，会覆盖 PrivKeyBytes）
+3. `PrivKeyBytes`（仅有字节数组时使用）
+
+验签公钥加载优先级：
+
+1. `PubKeyBytes`
+2. `PubKeyFile`
+3. 从 `Key` 派生公钥
 
 若使用公钥验签模式（Verify-Only），只需提供 `PubKeyBytes` 或 `PubKeyFile`，此时 `LoginHandler` 和 `RefreshHandler` 会因缺少私钥而失败。
 
@@ -109,6 +116,23 @@ type Token struct {
 ```
 
 > 注意：默认 `LoginResponse` / `RefreshResponse` 中的 `"expire"` 字段是 `ExpiresAt` 转换的 RFC3339 格式字符串，**不是** 直接返回 `expires_at` 字段。`ExpiresIn` 不是结构体字段，而是通过 `Token.ExpiresIn()` 方法计算。`ExpiresIn()` 返回 `ExpiresAt - time.Now().Unix()`（剩余秒数）。
+
+## Cookie 行为说明
+
+- `CookieMaxAge` 确实会生效，但仅影响 Access Token Cookie，不影响 Refresh Token Cookie。
+- `LoginHandler` / `RefreshHandler` 写入 Access Token Cookie 时：
+  - 若 `CookieMaxAge > 0`，使用 `CookieMaxAge`
+  - 否则使用当前 Access Token 的剩余有效期
+- 直接调用 `SetCookie` 时：
+  - 若 `CookieMaxAge > 0`，使用 `CookieMaxAge`
+  - 否则回退到 `Timeout`
+- Refresh Token Cookie 的 `Max-Age` 不受 `CookieMaxAge` 影响：
+  - 默认使用 `RefreshTokenTimeout`
+  - 登录/刷新流程中若已计算出 `RefreshExpiresAt`，则使用 Refresh Token 的剩余有效期
+  - 当设置了 `MaxRefresh` 时，实际值会取 `RefreshTokenTimeout` 与 `MaxRefresh` 窗口上限中的较早者
+- 只有 `SendCookie=true` 时，登录/刷新会写入 Access Token 和 Refresh Token Cookie，登出时也才会清除这两个 Cookie。
+- `RefreshHandler` / `LogoutHandler` 读取 Refresh Token 时，会先读名为 `RefreshTokenCookieName` 的 Cookie；若没有，再读同名表单字段。
+- 当 `SendCookie=true` 时，`MiddlewareInit` 会无条件将 `RefreshTokenSecureCookie` 和 `RefreshTokenCookieHTTPOnly` 设为 `true`，即使调用方原先传入 `false` 也会被覆盖。
 
 ## 配置示例
 

@@ -23,7 +23,7 @@ if err != nil {
 
 - 私钥文件权限应限制为 `0600`，属主仅运行进程的用户
 - 私钥不应写入代码仓库或日志
-- 推荐使用文件路径 `PrivKeyFile` 加载，而非 `PrivKeyBytes`，后者会将密钥载入进程内存长青树
+- 推荐把密钥放在受限权限的外部文件或 secret 挂载中，再通过 `PrivKeyFile` 加载，以减少源码、环境变量和部署清单中的暴露面；但要注意，当前实现读取文件后仍会把密钥材料加载到进程内存中用于签名
 
 ```go
 mw := &jwtmw.ToukaJWTMiddleware{
@@ -82,11 +82,11 @@ Refresh token 是长期 bearer secret，放在 URL 中存在以下风险：
 - **Referer 头传递**：跳转到第三方页面时自动携带完整 URL
 - **缓存污染**：代理服务器可能缓存包含 token 的 URL
 
-Touka JWT Middleware 的 `extractRefreshToken` 方法（`auth_jwt.go:662-670`）明确只从 cookie 和 form body 提取 token，不从 query string 读取，这是正确的设计。
+Touka JWT Middleware 的 `extractRefreshToken` 只从 refresh token cookie 和同名 form 字段提取 token，不从 header、query string、path param 读取。这避免了把长期 bearer secret 暴露到 URL 或通用认证头。
 
 ### 2.2 Cookie + Form 的提取方式
 
-Refresh token 提取顺序（`auth_jwt.go:662-670`）：
+Refresh token 提取顺序（`auth_jwt.go`）：
 
 ```go
 func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
@@ -100,9 +100,15 @@ func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
 }
 ```
 
+实现语义：
+
+- 优先读取 `RefreshTokenCookieName` 对应的 cookie
+- 只有 cookie 为空时，才读取同名 `POST form` 字段
+- 不会复用 `TokenLookup` 的 access token 提取规则；即使 access token 配成从 header/query/cookie 读取，refresh token 仍然只走 cookie/form
+
 **推荐配置**：
 
-- 优先使用 **Cookie** 传输 refresh token，配合 `SecureCookie: true` 和 `CookieHTTPOnly: true`
+- 优先使用专用 refresh token cookie，配合 `RefreshTokenSecureCookie: true` 和 `RefreshTokenCookieHTTPOnly: true`
 - Form body 方式适用于不支持 Cookie 的场景（如移动端原生应用），但应配合 HTTPS
 - 不要同时在 URL query string 中传递 refresh token
 
@@ -110,7 +116,12 @@ func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
 
 Refresh token rotation 是指每次 refresh 时颁发新 token 并使旧 token 失效。这能限制被盗 token 的有效期。
 
-Touka JWT Middleware 的处理逻辑（`auth_jwt.go:514-548`）：
+Touka JWT Middleware 的处理逻辑（`auth_jwt.go`）有几个关键点：
+
+- `RefreshHandler` 在生成新 token 前，会先 `Get` 一次旧 refresh token 并校验状态
+- `rotateRefreshToken` 会对 `oldToken` 获取进程内互斥锁后，对 `oldToken` 执行 `Get` 并再次校验状态；整个流程中 `Get` 调用发生两次（`RefreshHandler` 入口一次、`rotateRefreshToken` 内部一次），结合持锁校验，避免同进程并发 refresh 直接复用同一个旧 token
+- 只有 `TokenStore` 实现了 `core.RefreshTokenRotator` 时才允许轮换；否则直接返回 `ErrUnsafeRefreshRotation`
+- 中间件不做 `Set(new) -> Delete(old)` 之类的非原子回退，也没有“先写新 token、失败再回滚”的补救路径；原子性完全由 store 的 `Rotate` 保证
 
 ```go
 func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
@@ -132,28 +143,55 @@ func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, 
 		if err := rotator.Rotate(ctx, oldToken, newToken, currentToken, expiry); err != nil {
 			return err
 		}
-		setRefreshTokenSuccessor(oldToken, newToken)
+		setRefreshTokenSuccessor(oldToken, newToken, expiry, mw.TimeFunc())
 		return nil
 	}
 	return ErrUnsafeRefreshRotation
 }
 ```
 
-**关键要求**：refresh token rotation 必须是原子的。中间件不再接受非原子的 `Set(new) -> Delete(old)` 回退流程，因为这会产生新旧 token 同时有效的窗口。
+**失败语义**：
 
-**推荐做法**：TokenStore 实现 `core.RefreshTokenRotator` 接口，提供原子 `Rotate` 操作。内置的 `InMemoryRefreshTokenStore` 已实现此接口（`store/memory.go:13`）。如果自定义 store 未实现该接口，`RefreshHandler` 会直接拒绝 refresh 请求。
+- `Rotate` 返回 `ErrRefreshTokenNotFound` 或 `ErrRefreshTokenExpired` 时，refresh 请求按未授权处理，客户端不得假设旧 token 仍可继续安全使用
+- `Rotate` 返回其他错误时，refresh 请求按服务端错误处理；中间件不会发送新 cookie，也不会把新 token 返回给客户端
+- 因为新 token 在成功轮换前不会对客户端可见，所以中间件侧不存在需要额外“回滚已发放 token”的步骤
 
-### 2.4 长期 Token 的风险
+**推荐做法**：TokenStore 必须实现 `core.RefreshTokenRotator`，并让 `Rotate` 在底层存储中以单个原子事务/脚本/条件更新完成“验证旧 token 仍有效、删除旧 token、写入新 token”。内置的 `InMemoryRefreshTokenStore` 已实现该接口；自定义 store 未实现该接口时，`RefreshHandler` 会直接拒绝 refresh 请求。
+
+### 2.4 锁、状态校验与注销链路
+
+当前实现不仅在 refresh 时加锁，还维护了一个进程内 successor 链：旧 refresh token 轮换成功后，会记录 `old -> new` 映射；`LogoutHandler` 会从当前 refresh token 开始，沿着这条链删除后继 token，尽量覆盖同一进程内发生过的连续轮换。
+
+这带来以下安全语义：
+
+- 同进程并发 refresh：`oldToken` 上的互斥锁能序列化 `rotateRefreshToken`
+- refresh 时的 `MaxRefreshUntil` 会在进入 handler 后校验一次，在持锁轮换时再校验一次，避免并发窗口绕过过期判断
+- logout 只会沿着当前进程内记住的 successor 链继续删除；如果链信息不存在，logout 只删除当前提交上来的 refresh token
+- successor 链仅用于后续 logout 清理，不参与 refresh 鉴权；真正决定 refresh 是否成功的仍是 store 中旧 token 的存在性、过期时间和 `MaxRefreshUntil`
+
+### 2.5 多实例与非原子轮换风险
+
+当前实现对多实例部署的安全边界需要明确说明：
+
+- `acquireRefreshTokenLock` 和 successor 链都是进程内内存结构，不会在多个应用实例之间共享
+- 因此，多实例部署时，跨实例并发 refresh 不能依赖这把锁，只能依赖底层 `TokenStore.Rotate` 的原子性和条件检查
+- 如果 store 的 `Rotate` 不是单条原子操作，而是拆成多步写入，就可能出现双成功、旧新 token 同时有效或部分失败后的不一致
+- logout 对“已轮换出的后继 token”的级联删除，在多实例下也不是全局可靠的；某个实例不知道另一实例记录的 successor 链时，可能只删除当前 token
+
+**结论**：多实例生产环境中，真正的安全前提是共享存储上的原子 `Rotate`。进程内锁和 successor 链只能降低单实例内的竞争，不能替代分布式锁或存储级原子条件更新。
+
+### 2.6 长期 Token 的风险
 
 Refresh token 本质是长期 bearer secret，风险随时间累积：
 
-- **被动泄露**：即使 HTTPS 加密，token 仍存储在客户端，可能被 XSS 盗取
+- **被动泄露**：token 仍存储在客户端。若使用可被脚本读取的存储介质，XSS 可直接窃取；若使用 `HttpOnly` cookie，XSS 仍可能借助受害者浏览器发起受信请求，但不能直接读出 cookie 值
 - **主动攻击**：CSRF 攻击在用户不知情时使用已登录状态发起 refresh 请求
-- **密钥泄露**：长期 token 的安全性依赖初始签发时的密钥，密钥泄露意味着所有历史 token 失效
+- **服务端存储泄露**：refresh token 是随机 bearer secret，若 token store 被读取，攻击者可直接重放未过期 token
 
 **缓解措施**：
 
 - 设定 refresh token 最大有效期（`RefreshTokenTimeout`），建议不超过 30 天
+- 对需要绝对上限的场景，同时设置 `MaxRefresh`，让每次轮换后的实际过期时间不超过 `MaxRefreshUntil`
 - 记录 refresh token 使用的 IP、User-Agent，异常时拒绝 rotation
 - 实现 token 撤销机制，支持主动使旧 token 失效
 
@@ -173,7 +211,18 @@ SecureCookie: true, // 启用后仅 HTTPS 传输
 
 本地开发如果使用 HTTP，临时将此值设为 `false`，但必须确保生产环境为 `true`。
 
-### 3.2 CookieHTTPOnly
+### 3.2 `SendCookie` 与两类 Cookie 的差异
+
+`SendCookie` 只控制“是否把 token 写入响应 cookie”，但它对 access token cookie 和 refresh token cookie 的默认安全属性影响不同：
+
+- `SendCookie: false` 时，不会写 access token cookie，也不会写 refresh token cookie
+- `SendCookie: true` 时，`setAccessTokenCookie` 会写入 `CookieName` 指定的 access token cookie，但是否 `Secure` / `HttpOnly` 取决于 middleware 的 `SecureCookie` 和 `CookieHTTPOnly` 配置（需手动设置为 `true`）；同理，直接调用的 `SetCookie` 方法传入的 secure/httpOnly 参数来自 middleware 配置字段，而非由调用方随意指定
+- `SendCookie: true` 时，初始化阶段会把 `RefreshTokenSecureCookie` 和 `RefreshTokenCookieHTTPOnly` 自动设为 `true`，然后 `SetRefreshTokenCookie` 再写入 refresh token cookie
+- logout 清 cookie 也受 `SendCookie` 控制；如果没有启用 `SendCookie`，logout 不会额外尝试删除浏览器中的 cookie
+
+另外，access token cookie 的 `Max-Age` 以 access token 剩余有效期为准；refresh token cookie 的 `Max-Age` 以 `RefreshExpiresAt` 或 `RefreshTokenTimeout` 为准，二者并不共享同一过期策略。
+
+### 3.3 CookieHTTPOnly
 
 `CookieHTTPOnly: true` 防止 JavaScript 通过 `document.cookie` 读取 Cookie。**必须开启**。
 
@@ -181,11 +230,11 @@ SecureCookie: true, // 启用后仅 HTTPS 传输
 RefreshTokenCookieHTTPOnly: true,  // 启用后 JS 无法访问
 ```
 
-这是对抗 XSS 攻击的核心防线。即使攻击者能在页面执行 JS，也无法直接获取 refresh token。
+这是对抗 token 直接泄露的核心防线。即使攻击者能在页面执行 JS，也无法直接读取该 cookie 的值。
 
-注意：当 `SendCookie: true` 时，Touka JWT Middleware 仅针对 **RefreshToken cookie** 自动设置 `RefreshTokenSecureCookie: true` 和 `RefreshTokenCookieHTTPOnly: true`（`auth_jwt.go:165-168`）。普通 access token cookie 的 `SecureCookie` 和 `CookieHTTPOnly` 不会被自动设置，如需启用请手动配置。
+注意：当 `SendCookie: true` 时，中间件只会自动加固 refresh token cookie。普通 access token cookie 的 `SecureCookie` 和 `CookieHTTPOnly` 仍需手动显式配置。
 
-### 3.3 CookieSameSite
+### 3.4 CookieSameSite
 
 `CookieSameSite` 防止 CSRF 攻击。建议配置：
 
@@ -201,7 +250,7 @@ CookieSameSite: http.SameSiteStrictMode,
 
 **警告**：`SameSiteNoneMode` 必须在 `SecureCookie: true` 时使用，否则浏览器会拒绝设置 cookie。
 
-### 3.4 CookieDomain
+### 3.5 CookieDomain
 
 `CookieDomain` 控制 cookie 的有效域名范围：
 
@@ -255,7 +304,7 @@ add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" alway
 | Token 类型 | 建议过期时间 | 说明 |
 |------------|--------------|------|
 | Access Token | 15 分钟 - 1 小时 | 短期token，泄露窗口小 |
-| Refresh Token | 1 天 - 30 天 | 取决于安全需求，更短更安全 |
+| Refresh Token | 1 天 - 30 天 | 取决于安全需求，更短更安全；若允许持续轮换，建议再设置 `MaxRefresh` 作为绝对上限 |
 
 ```go
 mw := &jwtmw.ToukaJWTMiddleware{
@@ -314,8 +363,8 @@ mw := &jwtmw.ToukaJWTMiddleware{
 
 // Cookie 安全配置
 SendCookie: true,
-// 当 SendCookie: true 时，RefreshTokenSecureCookie 和 RefreshTokenCookieHTTPOnly 会自动设为 true，
-// 以下两行可省略（此处仅为明确展示完整配置）
+// 当 SendCookie: true 时，RefreshTokenSecureCookie 和 RefreshTokenCookieHTTPOnly 会自动设为 true。
+// access token cookie 的 Secure/HttpOnly 不会自动开启，因此仍显式设置 SecureCookie/CookieHTTPOnly。
 RefreshTokenSecureCookie: true, // 已自动设置，此处显式声明
 RefreshTokenCookieHTTPOnly: true, // 已自动设置，此处显式声明
 CookieHTTPOnly: true,

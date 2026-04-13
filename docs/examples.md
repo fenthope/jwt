@@ -25,18 +25,25 @@ type login struct {
 	Password string `form:"password" json:"password" binding:"required"`
 }
 
+var (
+	identityKey = "id"
+	port        string
+)
+
 type User struct {
 	UserName  string
 	FirstName string
 	LastName  string
 }
 
-func main() {
-	port := os.Getenv("PORT")
+func init() {
+	port = os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
 	}
+}
 
+func main() {
 	engine := touka.Default()
 	authMiddleware, err := jwt.New(initParams())
 	if err != nil {
@@ -63,27 +70,31 @@ func initParams() *jwt.ToukaJWTMiddleware {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	return &jwt.ToukaJWTMiddleware{
 		Realm:       "test zone",
 		Key:         privateKey,
 		Timeout:     time.Hour,
 		MaxRefresh:  time.Hour * 24 * 7,
-		IdentityKey: "id",
+		IdentityKey: identityKey,
 		PayloadFunc: payloadFunc(),
+
 		IdentityHandler: identityHandler(),
-		Authenticator: authenticator(),
-		Authorizator: authorizator(),
-		Unauthorized: unauthorized(),
-		TokenLookup:  "header: Authorization, query: token, cookie: jwt",
-		TokenHeadName: "Bearer",
-		TimeFunc: time.Now,
+		Authenticator:   authenticator(),
+		Authorizator:    authorizator(),
+		Unauthorized:    unauthorized(),
+		TokenLookup:     "header: Authorization, query: token, cookie: jwt",
+		TokenHeadName:   "Bearer",
+		TimeFunc:        time.Now,
 	}
 }
 
 func payloadFunc() func(data any) jwt.MapClaims {
 	return func(data any) jwt.MapClaims {
 		if v, ok := data.(*User); ok {
-			return jwt.MapClaims{"id": v.UserName}
+			return jwt.MapClaims{
+				identityKey: v.UserName,
+			}
 		}
 		return jwt.MapClaims{}
 	}
@@ -93,7 +104,7 @@ func identityHandler() func(c *touka.Context) any {
 	return func(c *touka.Context) any {
 		claims := jwt.ExtractClaims(c)
 		return &User{
-			UserName: claims["id"].(string),
+			UserName: claims[identityKey].(string),
 		}
 	}
 }
@@ -109,8 +120,8 @@ func authenticator() func(c *touka.Context) (any, error) {
 
 		if (userID == "admin" && password == "admin") || (userID == "test" && password == "test") {
 			return &User{
-				UserName: userID,
-				LastName: "Bo-Yi",
+				UserName:  userID,
+				LastName:  "Bo-Yi",
 				FirstName: "Wu",
 			}, nil
 		}
@@ -138,9 +149,9 @@ func unauthorized() func(c *touka.Context, code int, message string) {
 
 func helloHandler(c *touka.Context) {
 	claims := jwt.ExtractClaims(c)
-	user, _ := c.Get("id")
+	user, _ := c.Get(identityKey)
 	c.JSON(200, touka.H{
-		"userID":   claims["id"],
+		"userID":   claims[identityKey],
 		"userName": user.(*User).UserName,
 		"text":     "Hello World.",
 	})
@@ -161,7 +172,7 @@ curl http://localhost:8000/auth/hello \
 
 ## 2. Verify-Only Mode
 
-如果服务只负责验证 token、不负责签发，可以使用 Verify-Only 模式。此时只需提供公钥，无法调用 `LoginHandler` 和 `RefreshHandler`。
+如果服务只负责验证 token、不负责签发，可以使用 Verify-Only 模式。此时只提供公钥，不配置私钥，因此不能调用 `LoginHandler` 和 `RefreshHandler`。
 
 ```go
 package main
@@ -177,24 +188,24 @@ import (
 )
 
 func main() {
-    // 生成密钥对（生产环境应持久化）
+    // 这里假设公钥已经持久化并从配置或文件中读出。
     privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
     if err != nil {
         log.Fatal(err)
     }
 
+    publicKeyBytes := privateKey.PublicKey().Bytes()
+
     // 只提供公钥，不提供私钥
     authMiddleware, err := jwtmw.New(&jwtmw.ToukaJWTMiddleware{
-        Realm:      "api",
-        Key:        privateKey, // 签发时需要私钥，验证时实际使用公钥
-        PubKeyBytes: privateKey.PublicKey().Bytes(), // 显式指定公钥
-        Timeout:    time.Hour,
-        IdentityKey: "user_id",
+        Realm:       "api",
+        PubKeyBytes: publicKeyBytes,
+        Timeout:     time.Hour,
+        IdentityKey: "id",
 
-        // Verify-Only 模式下 Authenticator 不会被调用
-        // 但字段仍需存在以通过初始化检查
-        Authenticator: func(c *touka.Context) (any, error) {
-            return nil, nil
+        IdentityHandler: func(c *touka.Context) any {
+            claims := jwtmw.ExtractClaims(c)
+            return claims["id"]
         },
     })
     if err != nil {
@@ -213,7 +224,7 @@ func main() {
 func dataHandler(c *touka.Context) {
     claims := jwtmw.ExtractClaims(c)
     c.JSON(200, touka.H{
-        "user_id": claims["user_id"],
+        "user_id": claims["id"],
         "message": "verified",
     })
 }
@@ -223,6 +234,8 @@ func dataHandler(c *touka.Context) {
 - API 网关
 - 资源服务器
 - 只做权限验证的微服务
+
+> 说明：当前实现初始化时不会强制要求配置 `Authenticator`。只有调用 `LoginHandler` 时，才会检查该回调是否存在。
 
 ## 3. Custom Authenticator
 
@@ -310,15 +323,15 @@ var user User
 	if err == sql.ErrNoRows {
 		return nil, jwtmw.ErrFailedAuthentication
 	}
+	if err != nil {
+		return nil, err
+	}
 
 	// 验证密码：比对哈希值
 	hashedInput := hashPassword(req.Password)
 	if user.Password != hashedInput {
 		return nil, jwtmw.ErrFailedAuthentication
 	}
-            if err != nil {
-                return nil, err
-            }
 
             // 返回完整的 User 结构体，供后续处理器使用
             return &user, nil
@@ -338,9 +351,11 @@ var user User
         // 自定义身份处理：从 claims 中提取并设置到上下文
         IdentityHandler: func(c *touka.Context) any {
             claims := jwtmw.ExtractClaims(c)
+            userID, _ := claims["user_id"].(float64)
+            role, _ := claims["role"].(string)
             return &User{
-                ID:   claims["user_id"].(int64),
-                Role: claims["role"].(string),
+                ID:   int64(userID),
+                Role: role,
             }
         },
 
@@ -458,7 +473,7 @@ func profileHandler(c *touka.Context) {
 | `RefreshTokenSecureCookie` | refresh token 的安全设置 |
 | `RefreshTokenCookieHTTPOnly` | refresh token 的 HTTP Only 设置 |
 
-> 注意：cookie 有效期由 `Timeout`（access token）和 `RefreshTokenTimeout`（refresh token）计算，代码中不使用 `CookieMaxAge` 字段。
+> 注意：`CookieMaxAge` 只作用于 access token cookie。登录/刷新流程中若未设置 `CookieMaxAge`，access token cookie 使用当前 token 的剩余有效期；refresh token cookie 则按 `RefreshTokenTimeout` 及 `MaxRefresh` 共同计算。
 
 ## 5. Token Lookup
 

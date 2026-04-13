@@ -4,17 +4,18 @@
 
 Touka 的 JWT 中间件。
 
-当前内置并默认使用 `ML-DSA-65`，同时把算法接入抽象成接口，后续可以注册其他签名算法实现。
+当前默认使用 `ML-DSA-65`，同时把算法接入抽象成接口。包内已注册 `ML-DSA-65` 与 `HS512` 两个实现，也支持继续注册其他签名算法实现。
 
 ## Current Defaults
 
 - 默认 `SigningAlgorithm`：`ML-DSA-65`
-- 内置算法实现：`ML-DSA-65`
+- 包内已注册算法实现：`ML-DSA-65`、`HS512`
 - refresh token 默认存储：内存 `TokenStore`
 - refresh token 提取顺序：cookie，然后 form
 - 示例 refresh endpoint：`POST /refresh_token`
 - `TokenLookup`：`header:Authorization`
 - `Timeout`：`time.Hour`
+- `RefreshTokenTimeout`：若 `MaxRefresh != 0` 则默认等于 `MaxRefresh`，否则默认 `7 * 24 * time.Hour`
 - `TimeFunc`：`time.Now`
 - `IdentityKey`：`identity`
 - `TokenHeadName`：`Bearer`
@@ -26,9 +27,9 @@ Touka 的 JWT 中间件。
 
 如果你从旧版本迁移，需要注意：
 
-- 旧的 `HS*` / `RS*` token 在升级后不会继续通过验签
-- 旧的 `Key: []byte("secret")` 初始化方式不再适用
-- `PrivKeyBytes` / `PrivKeyFile` 不再表示 HMAC secret 或 PEM，它们现在是算法实现自己的 key 输入字节
+- 如果继续使用默认算法 `ML-DSA-65`，旧的 `HS*` / `RS*` token 不会直接通过验签
+- 如果继续使用默认算法 `ML-DSA-65`，旧的 `Key: []byte("secret")` 初始化方式不再适用
+- 在 `ML-DSA-65` 下，`PrivKeyBytes` / `PrivKeyFile` 不再表示 HMAC secret 或 PEM，它们现在是算法实现自己的 key 输入字节
 - 默认内置算法 `ML-DSA-65` 下：
   - `PrivKeyBytes` / `PrivKeyFile` 表示原始 32 字节 seed
   - `PubKeyBytes` / `PubKeyFile` 表示 `mldsa.PublicKey.Bytes()` 的原始编码
@@ -60,7 +61,7 @@ func middleware() *jwtmw.ToukaJWTMiddleware {
 		panic(err)
 	}
 
-	return &jwtmw.ToukaJWTMiddleware{
+	mw, err := jwtmw.New(&jwtmw.ToukaJWTMiddleware{
 		Realm:      "test zone",
 		Key:        privateKey,
 		Timeout:    time.Hour,
@@ -71,7 +72,12 @@ func middleware() *jwtmw.ToukaJWTMiddleware {
 		PayloadFunc: func(data any) jwtmw.MapClaims {
 			return jwtmw.MapClaims{"identity": data}
 		},
+	})
+	if err != nil {
+		panic(err)
 	}
+
+	return mw
 }
 ```
 
@@ -80,9 +86,13 @@ func middleware() *jwtmw.ToukaJWTMiddleware {
 如果某个服务只需要验签、不需要签发 token，可以只提供公钥输入：
 
 ```go
-mw := &jwtmw.ToukaJWTMiddleware{
-	Realm:       "test zone",
+mw, err := jwtmw.New(&jwtmw.ToukaJWTMiddleware{
+	Realm: "test zone",
 	PubKeyBytes: publicKey.Bytes(),
+	SigningAlgorithm: jwtmw.SigningAlgorithmMLDSA65,
+})
+if err != nil {
+	panic(err)
 }
 ```
 
@@ -109,7 +119,7 @@ type Algorithm interface {
 
 如果 `SigningAlgorithm` 留空，仍默认选择内置的 `ML-DSA-65`。
 
-仓库里还提供了一个 `HS512` 适配实现，主要用于验证 `Algorithm` 接口可以接入其他算法。它是测试和兼容性样例，不代表这里推荐把 `HS512` 作为默认生产配置。
+包内还注册了一个 `HS512` 适配实现，主要用于验证 `Algorithm` 接口可以接入其他算法。它更适合作为兼容性样例，不代表这里推荐把 `HS512` 作为默认生产配置。
 
 ## Built-In ML-DSA-65 Semantics
 
@@ -145,6 +155,12 @@ type RefreshTokenRotator interface {
 
 如果 store 没有实现这个接口，`RefreshHandler` 会返回错误而不是回退到非原子 `Set(new) -> Delete(old)` 流程。默认内存 store 已实现该接口。
 
+refresh token 的生命周期还受两个时长共同影响：
+
+- 每次生成或轮换时，底层 store 中保存的 refresh token 过期时间为 `min(now + RefreshTokenTimeout, MaxRefreshUntil)`
+- 如果设置了 `MaxRefresh`，首次登录时会把绝对上限写入 `RefreshTokenState.MaxRefreshUntil`
+- `RefreshHandler` 返回的新 refresh token 会继承原来的绝对上限，不会因为轮换而无限续期
+
 ## Example App
 
 完整示例见 `_example/basic/server.go`。
@@ -166,5 +182,5 @@ type RefreshTokenRotator interface {
 ## Notes
 
 - `TokenLookup` 仍支持 access token 从 `header` / `query` / `cookie` / `param` / `form` 读取
-- refresh token 提取不使用 `TokenLookup`，而是固定走 cookie 和 form
+- refresh token 提取不使用 `TokenLookup`，而是固定走 `RefreshTokenCookieName` 对应的 cookie 和同名 form 字段
 - 默认认证头前缀仍是 `Bearer`

@@ -28,6 +28,7 @@ type ToukaJWTMiddleware struct {
     LogoutResponse func(c *touka.Context, code int)
     RefreshResponse func(c *touka.Context, code int, token *core.Token)
     Unauthorized   func(c *touka.Context, code int, message string)
+    HTTPStatusMessageFunc func(e error, c *touka.Context) string
 
     // 自定义 claims 提取逻辑
     IdentityKey    string
@@ -84,7 +85,7 @@ type Token struct {
 	TokenType string `json:"token_type"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresAt int64 `json:"expires_at"` // Unix 时间戳（秒）
-	CreatedAt int64 `json:"created_at,omitempty"`
+	CreatedAt int64 `json:"created_at"`
 	RefreshExpiresAt int64 `json:"refresh_expires_at,omitempty"` // refresh token 过期时间
 }
 
@@ -98,6 +99,36 @@ func (t *Token) ExpiresIn() int64 {
 > ```json
 > {"code": 200, "access_token": "...", "refresh_token": "...", "expire": "2024-01-01T12:00:00Z"}
 > ```
+
+### TokenStore / RefreshTokenRotator
+
+```go
+type TokenStore interface {
+    Set(ctx context.Context, token string, userData any, expiry time.Time) error
+    Get(ctx context.Context, token string) (any, error)
+    Delete(ctx context.Context, token string) error
+    Cleanup(ctx context.Context) (int, error)
+    Count(ctx context.Context) (int, error)
+}
+
+type RefreshTokenRotator interface {
+    TokenStore
+    Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+}
+```
+
+`TokenStore` 用于持久化 refresh token 及其关联的 `userData`。默认实现是内存 store：`store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)`。
+
+`RefreshTokenRotator` 用于原子地将旧 refresh token 轮换为新 token。`RefreshHandler` 在执行 refresh token rotation 时要求 `TokenStore` 实现该接口，否则返回 `ErrUnsafeRefreshRotation`。
+
+当配置了 `MaxRefresh` 时，store 中保存的数据不是裸 `userData`，而是：
+
+```go
+type RefreshTokenState struct {
+    UserData any       `json:"user_data"`
+    MaxRefreshUntil time.Time `json:"max_refresh_until,omitempty"`
+}
+```
 
 ---
 
@@ -134,10 +165,10 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context)
 ### 内部流程
 
 1. 调用 `Authenticator(c)` 验证用户凭据
-2. 若认证失败，调用 `Unauthorized` 返回 401
+2. 若认证失败，调用 `unauthorized` 返回 401，并设置 `WWW-Authenticate` 响应头；当 `DisabledAbort` 为 `false` 时会先 `Abort`
 3. 调用 `TokenGenerator` 生成 token pair
-4. 调用 `setAccessTokenCookie` 设置 access token cookie（若 `SendCookie` 为 true）
-5. 调用 `SetRefreshTokenCookie` 设置 refresh token cookie
+4. 调用 `setAccessTokenCookie` 设置 access token cookie（内部检查 `SendCookie`，仅在 `SendCookie=true` 时写入）
+5. 调用 `SetRefreshTokenCookie` 设置 refresh token cookie（内部检查 `SendCookie`，仅在 `SendCookie=true` 时写入）
 6. 调用 `LoginResponse` 返回响应
 
 ### 使用示例
@@ -199,7 +230,7 @@ func main() {
 |------|-------------|------|
 | `ErrMissingAuthenticatorFunc` | 500 | 未设置 Authenticator |
 | `Authenticator 返回 error` | 401 | 认证失败 |
-| `ErrFailedTokenCreation` | 401 | token 生成失败 |
+| `ErrFailedTokenCreation` | 401 | token 生成或存储失败 |
 | `ErrMissingPrivateKey` | 500 | 未配置签名密钥 |
 
 ---
@@ -226,16 +257,18 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context)
 
 ### 内部流程
 
-1. 从 cookie 或 form body（key 为 `RefreshTokenCookieName`，默认 `refresh_token`）提取 refresh token（`extractRefreshToken`）
+1. 按顺序从 cookie 或 form body（key 为 `RefreshTokenCookieName`，默认 `refresh_token`）提取 refresh token（`extractRefreshToken`）
 2. 若未找到 refresh token，返回 400
 3. 调用 `TokenStore.Get` 验证 refresh token 并获取关联的用户数据
 4. 若验证失败，返回 401
-5. 验证 `MaxRefresh` 限制（若配置了 `MaxRefresh`）
+5. 标准化并验证 refresh token 状态；若配置了 `MaxRefresh`，会校验 `MaxRefreshUntil`
 6. 调用 `generateTokenPair` 生成新 token pair
 7. 调用 `rotateRefreshToken` 执行 refresh token rotation：
    - store 必须实现 `RefreshTokenRotator` 接口，并调用原子 `Rotate`
-   - 若未实现，则返回服务端错误并拒绝 refresh
-8. 设置新的 access token 和 refresh token cookie
+   - 若未实现，则返回 `ErrUnsafeRefreshRotation`，HTTP 500
+   - 若 `rotateRefreshToken` 返回 `ErrRefreshTokenNotFound` 或 `ErrRefreshTokenExpired`，按 401 处理
+8. 新 token 的 `RefreshExpiresAt` 继承自旧 refresh token 状态的有效期上限，不会因为 refresh 而无限延长
+8. 若 `SendCookie` 为 `true`，设置新的 access token 和 refresh token cookie
 9. 调用 `RefreshResponse` 返回响应
 
 ### 使用示例
@@ -270,13 +303,15 @@ body: "refresh_token=xxx"
 | 错误 | HTTP 状态码 | 说明 |
 |------|-------------|------|
 | `ErrMissingRefreshToken` | 400 | 未提供 refresh token |
-| `TokenStore.Get` 失败 | 401 | refresh token 无效或已撤销 |
+| `core.ErrRefreshTokenNotFound` | 401 | refresh token 不存在或已撤销 |
+| `core.ErrRefreshTokenExpired` | 401 | refresh token 已过期，或超过 `MaxRefresh` 限制 |
+| `ErrUnsafeRefreshRotation` | 500 | `TokenStore` 未实现 `RefreshTokenRotator` |
 
 ---
 
 ## LogoutHandler
 
-用户登出，清除客户端的 token cookie。
+用户登出，并尽可能撤销 refresh token 链；若启用了 cookie，同时清除客户端 cookie。
 
 ### 函数签名
 
@@ -301,10 +336,12 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 
 ### 内部流程
 
-1. 从 cookie 或 form body 提取 refresh token
-2. 若找到 refresh token，遍历其完整刷新链（支持 refresh token rotation），从 `TokenStore` 中删除所有相关 token
-3. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
-4. 调用 `LogoutResponse` 返回响应
+1. 按顺序从 cookie 或 form body 提取 refresh token
+2. 若找到 refresh token，按当前进程内记录的 successor 链继续查找后继 refresh token，并从 `TokenStore` 中删除这些相关 token
+3. 删除过程中会忽略 `core.ErrRefreshTokenNotFound` 和 `core.ErrRefreshTokenExpired`
+4. 若删除出现其他错误，返回 500
+5. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
+6. 调用 `LogoutResponse` 返回响应
 
 ### 使用示例
 
@@ -312,7 +349,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 engine.POST("/logout", auth.LogoutHandler)
 ```
 
-注意：`LogoutHandler` 会自动遍历 refresh token 链并从 `TokenStore` 中删除所有相关 token，同时清除客户端 cookie。如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
+注意：`LogoutHandler` 会基于当前进程内记录的 refresh token successor 链删除相关 token，同时清除客户端 cookie。该链不是持久化状态，也不是跨实例共享状态；如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
 
 ---
 
@@ -344,7 +381,8 @@ func (mw *ToukaJWTMiddleware) MiddlewareFunc() touka.HandlerFunc
 4. 将 claims 存入 `c.Set("JWT_PAYLOAD", claims)`
 5. 调用 `IdentityHandler` 提取身份信息，存入 `c.Set(mw.IdentityKey, identity)`
 6. 调用 `Authorizator` 验证授权，失败返回 403
-7. 调用 `c.Next()` 继续处理链
+7. 若 `SendAuthorization` 为 `true`，会在成功解析后回写响应头 `Authorization: <TokenHeadName> <token>`
+8. 调用 `c.Next()` 继续处理链
 
 ### 使用示例
 
@@ -376,8 +414,9 @@ authGroup.GET("/protected", func(c *touka.Context) {
 
 | 错误 | HTTP 状态码 | 说明 |
 |------|-------------|------|
-| `ParseToken` 解析失败 | 401 | token 无效或过期 |
+| `ParseToken` 解析失败 | 401 | token 无效、签名不匹配、格式错误，或 JWT 库判定已过期/未生效 |
 | `ErrMissingExpField` | 400 | token 缺少 exp 字段 |
+| `ErrWrongFormatOfExp` | 400 | exp 字段格式错误 |
 | `ErrForbidden` | 403 | `Authorizator` 返回 false |
 
 ### Token 提取位置
@@ -424,10 +463,11 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error)
 1. 根据 `TokenLookup` 配置依次尝试从各位置提取 token
 2. 若所有位置都未找到 token，返回 `ErrEmptyAuthHeader`
 3. 调用 `jwt.Parse` 验证 token：
-   - 检查算法是否与配置匹配
-   - 若设置 `KeyFunc` 则调用它获取密钥，否则使用 `verifyKey`
-4. 验证通过后，将 raw token 存入 `c.Set("JWT_TOKEN", token)`
-5. 返回解析后的 token
+    - 检查算法是否与配置匹配
+    - 若设置 `KeyFunc` 则调用它获取密钥，否则使用 `verifyKey`
+4. 解析时总是附带 `jwt.WithTimeFunc(mw.TimeFunc)`，并追加 `ParseOptions`
+5. 验证通过后，将 raw token 存入 `c.Set("JWT_TOKEN", token)`
+6. 返回解析后的 token
 
 ### 使用示例
 
@@ -439,7 +479,7 @@ engine.GET("/verify", func(c *touka.Context) {
         return
     }
 
-    claims := jwt.ExtractClaimsFromToken(token)
+    claims := jwtmw.ExtractClaimsFromToken(token)
     c.JSON(200, touka.H{
         "claims": claims,
         "header": token.Header,
@@ -467,6 +507,7 @@ func GetToken(c *touka.Context) string
 | `ErrEmptyAuthHeader` | 未找到 token |
 | `ErrInvalidSigningAlgorithm` | 算法不匹配 |
 | `jwt.ErrTokenExpired` | token 已过期 |
+| `jwt.ErrTokenNotValidYet` | token 尚未生效 |
 | `jwt.ErrTokenMalformed` | token 格式错误 |
 
 ---
@@ -487,18 +528,21 @@ func New(mw *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error)
 |------|--------|
 | `SigningAlgorithm` | `ML-DSA-65` |
 | `Timeout` | `1 hour` |
+| `TimeoutFunc` | `func(data any) time.Duration { return mw.Timeout }` |
 | `RefreshTokenTimeout` | `7 days`（或 `MaxRefresh`） |
 | `IdentityKey` | `identity` |
 | `TokenHeadName` | `Bearer` |
 | `TokenLookup` | `header:Authorization` |
 | `CookieName` | `jwt` |
 | `RefreshTokenCookieName` | `refresh_token` |
-| `RefreshTokenSecureCookie` | 仅当 `SendCookie` 为 true 时为 `true` |
-| `RefreshTokenCookieHTTPOnly` | 仅当 `SendCookie` 为 true 时为 `true` |
+| `RefreshTokenSecureCookie` | 当 `SendCookie` 为 `true` 时被设置为 `true` |
+| `RefreshTokenCookieHTTPOnly` | 当 `SendCookie` 为 `true` 时被设置为 `true` |
 | `TimeFunc` | `time.Now` |
 | `ExpField` | `"exp"` |
 | `Authorizator` | 始终返回 true |
-| `TokenStore` | 内存 store |
+| `IdentityHandler` | 从 `JWT_PAYLOAD[mw.IdentityKey]` 读取身份 |
+| `HTTPStatusMessageFunc` | `error == nil` 时返回空字符串，否则返回 `error.Error()` |
+| `TokenStore` | `store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)` |
 | `Unauthorized` | 返回 JSON `{"code": <code>, "message": <message>}` |
 | `LoginResponse` | 返回 JSON 包含 access_token, refresh_token, expire |
 | `RefreshResponse` | 同 LoginResponse |
@@ -546,9 +590,13 @@ func main() {
         },
         PayloadFunc: func(data any) jwtmw.MapClaims {
             if u, ok := data.(*User); ok {
-                return jwtmw.MapClaims{"identity": u.UserName}
+                return jwtmw.MapClaims{"id": u.UserName}
             }
             return jwtmw.MapClaims{}
+        },
+        IdentityHandler: func(c *touka.Context) any {
+            claims := jwtmw.ExtractClaims(c)
+            return &User{UserName: claims["id"].(string)}
         },
         Authorizator: func(data any, c *touka.Context) bool {
             if u, ok := data.(*User); ok {
@@ -592,14 +640,15 @@ func main() {
 | `ErrInvalidPrivKey` | 无效的私钥 |
 | `ErrInvalidPubKey` | 无效的公钥 |
 | `ErrEmptyAuthHeader` | 认证头为空 |
-| `ErrInvalidAuthHeader` | 认证头格式错误 |
-| `ErrEmptyQueryToken` | query 参数中 token 为空 |
-| `ErrEmptyCookieToken` | cookie 中 token 为空 |
-| `ErrEmptyParamToken` | 路径参数中 token 为空 |
+| `ErrInvalidAuthHeader` | 错误常量已定义，但当前 `ParseToken` 实现不会直接返回它；header 不匹配时会继续尝试其他来源，全部失败后统一返回 `ErrEmptyAuthHeader` |
+| `ErrEmptyQueryToken` | 错误常量已定义，但当前实现不会直接返回它 |
+| `ErrEmptyCookieToken` | 错误常量已定义，但当前实现不会直接返回它 |
+| `ErrEmptyParamToken` | 错误常量已定义，但当前实现不会直接返回它 |
 | `ErrFailedAuthentication` | 认证失败（用户名或密码错误） |
 | `ErrMissingLoginValues` | 缺少登录凭据 |
 | `ErrFailedTokenCreation` | token 创建失败 |
 | `ErrMissingPrivateKey` | 缺少私钥 |
 | `ErrExpiredToken` | token 已过期 |
 | `ErrMissingRefreshToken` | 缺少 refresh token |
+| `ErrUnsafeRefreshRotation` | refresh token rotation 要求 store 实现 `RefreshTokenRotator` |
 | `ErrInvalidTokenLookup` | 无效的 token lookup 配置 |
