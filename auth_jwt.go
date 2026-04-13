@@ -3,9 +3,9 @@ package jwt
 import (
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
 	"encoding/base64"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -15,18 +15,19 @@ import (
 	"github.com/fenthope/jwt/store"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/infinite-iroha/touka"
-	"github.com/youmark/pkcs8"
 )
 
 type MapClaims jwt.MapClaims
 
 type ToukaJWTMiddleware struct {
-	Realm            string
+	Realm string
+	// Defaults to the built-in ML-DSA-65 implementation.
 	SigningAlgorithm string
-	Key              []byte
-	KeyFunc          func(token *jwt.Token) (any, error)
-	Timeout          time.Duration
-	TimeoutFunc      func(data any) time.Duration
+	// Key signs access tokens. Its concrete type depends on SigningAlgorithm.
+	Key         any
+	KeyFunc     func(token *jwt.Token) (any, error)
+	Timeout     time.Duration
+	TimeoutFunc func(data any) time.Duration
 
 	MaxRefresh          time.Duration
 	RefreshTokenTimeout time.Duration
@@ -64,16 +65,19 @@ type ToukaJWTMiddleware struct {
 	ParseOptions      []jwt.ParserOption
 	SendAuthorization bool
 
-	PrivKeyFile          string
-	PrivKeyBytes         []byte
-	PubKeyFile           string
-	PubKeyBytes          []byte
-	PrivateKeyPassphrase string
+	// PrivKeyFile points to the algorithm-specific signing-key input bytes.
+	PrivKeyFile string
+	// PrivKeyBytes contains the algorithm-specific signing-key input bytes.
+	PrivKeyBytes []byte
+	// PubKeyFile points to the algorithm-specific verification-key input bytes.
+	PubKeyFile string
+	// PubKeyBytes contains the algorithm-specific verification-key input bytes.
+	PubKeyBytes []byte
 
 	TokenStore core.TokenStore
 
-	privKey       *rsa.PrivateKey
-	pubKey        *rsa.PublicKey
+	algorithm     Algorithm
+	verifyKey     any
 	inMemoryStore *store.InMemoryRefreshTokenStore
 }
 
@@ -85,8 +89,6 @@ var (
 	ErrMissingExpField          = errors.New("missing exp field")
 	ErrWrongFormatOfExp         = errors.New("wrong format of exp field")
 	ErrInvalidSigningAlgorithm  = errors.New("invalid signing algorithm")
-	ErrNoPrivKeyFile            = errors.New("private key file is missing")
-	ErrNoPubKeyFile             = errors.New("public key file is missing")
 	ErrInvalidPrivKey           = errors.New("invalid private key")
 	ErrInvalidPubKey            = errors.New("invalid public key")
 	ErrEmptyAuthHeader          = errors.New("auth header is empty")
@@ -97,6 +99,7 @@ var (
 	ErrFailedAuthentication     = errors.New("incorrect Username or Password")
 	ErrMissingLoginValues       = errors.New("missing Username or Password")
 	ErrFailedTokenCreation      = errors.New("failed to create token")
+	ErrMissingPrivateKey        = errors.New("private key is missing")
 	ErrExpiredToken             = errors.New("token is expired")
 	ErrMissingRefreshToken      = errors.New("refresh token is missing")
 )
@@ -113,7 +116,7 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 		mw.TokenLookup = "header:Authorization"
 	}
 	if mw.SigningAlgorithm == "" {
-		mw.SigningAlgorithm = "HS256"
+		mw.SigningAlgorithm = SigningAlgorithmMLDSA65
 	}
 	if mw.Timeout == 0 {
 		mw.Timeout = time.Hour
@@ -206,86 +209,103 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	if mw.Realm == "" {
 		return ErrMissingRealm
 	}
-	if mw.usingPublicKeyAlgo() {
-		return mw.readKeys()
+	if mw.SigningAlgorithm != SigningAlgorithmMLDSA65 {
+		if _, ok := LookupAlgorithm(mw.SigningAlgorithm); !ok {
+			return ErrInvalidSigningAlgorithm
+		}
 	}
-	if mw.Key == nil {
+	alg, ok := LookupAlgorithm(mw.SigningAlgorithm)
+	if !ok {
+		return ErrInvalidSigningAlgorithm
+	}
+	mw.algorithm = alg
+	if err := mw.readKeys(); err != nil {
+		return err
+	}
+	if mw.Key == nil && mw.verifyKey == nil {
 		return ErrMissingSecretKey
 	}
 	return nil
 }
 
 func (mw *ToukaJWTMiddleware) readKeys() error {
-	if err := mw.privateKey(); err != nil {
-		return err
+	hasPrivateKey := mw.Key != nil || len(mw.PrivKeyBytes) > 0 || mw.PrivKeyFile != ""
+	hasPublicKey := mw.verifyKey != nil || len(mw.PubKeyBytes) > 0 || mw.PubKeyFile != ""
+
+	if hasPrivateKey {
+		if err := mw.privateKey(); err != nil {
+			return err
+		}
 	}
-	return mw.publicKey()
+	if hasPublicKey || mw.Key != nil {
+		if err := mw.publicKey(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (mw *ToukaJWTMiddleware) privateKey() error {
+	if mw.Key != nil {
+		return nil
+	}
 	var keyData []byte
 	if mw.PrivKeyFile == "" {
 		if len(mw.PrivKeyBytes) > 0 {
 			keyData = mw.PrivKeyBytes
 		} else {
-			return ErrNoPrivKeyFile
+			return ErrInvalidPrivKey
 		}
 	} else {
 		filecontent, err := os.ReadFile(mw.PrivKeyFile)
 		if err != nil {
-			return ErrNoPrivKeyFile
+			return ErrInvalidPrivKey
 		}
 		keyData = filecontent
 	}
-	if mw.PrivateKeyPassphrase != "" {
-		key, err := pkcs8.ParsePKCS8PrivateKey(keyData, []byte(mw.PrivateKeyPassphrase))
-		if err != nil {
-			return ErrInvalidPrivKey
-		}
-		var ok bool
-		mw.privKey, ok = key.(*rsa.PrivateKey)
-		if !ok {
-			return ErrInvalidPrivKey
-		}
-	} else {
-		key, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
-		if err != nil {
-			return ErrInvalidPrivKey
-		}
-		mw.privKey = key
+	key, err := mw.algorithm.LoadSigningKey(keyData)
+	if err != nil {
+		return ErrInvalidPrivKey
 	}
+	mw.Key = key
 	return nil
 }
 
 func (mw *ToukaJWTMiddleware) publicKey() error {
+	if mw.verifyKey != nil {
+		return nil
+	}
+	if len(mw.PubKeyBytes) == 0 && mw.PubKeyFile == "" {
+		if mw.Key == nil {
+			return ErrMissingSecretKey
+		}
+		verifyKey, err := mw.algorithm.VerificationKeyFromSigningKey(mw.Key)
+		if err != nil {
+			return ErrInvalidPubKey
+		}
+		mw.verifyKey = verifyKey
+		return nil
+	}
 	var keyData []byte
 	if mw.PubKeyFile == "" {
 		if len(mw.PubKeyBytes) > 0 {
 			keyData = mw.PubKeyBytes
 		} else {
-			return ErrNoPubKeyFile
+			return ErrMissingSecretKey
 		}
 	} else {
 		filecontent, err := os.ReadFile(mw.PubKeyFile)
 		if err != nil {
-			return ErrNoPubKeyFile
+			return ErrInvalidPubKey
 		}
 		keyData = filecontent
 	}
-	key, err := jwt.ParseRSAPublicKeyFromPEM(keyData)
+	key, err := mw.algorithm.LoadVerificationKey(keyData)
 	if err != nil {
 		return ErrInvalidPubKey
 	}
-	mw.pubKey = key
+	mw.verifyKey = key
 	return nil
-}
-
-func (mw *ToukaJWTMiddleware) usingPublicKeyAlgo() bool {
-	switch mw.SigningAlgorithm {
-	case "RS256", "RS384", "RS512":
-		return true
-	}
-	return false
 }
 
 func (mw *ToukaJWTMiddleware) MiddlewareFunc() touka.HandlerFunc {
@@ -344,6 +364,10 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 	}
 	tokenPair, err := mw.TokenGenerator(c.Request.Context(), data)
 	if err != nil {
+		if errors.Is(err, ErrMissingPrivateKey) {
+			mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
+			return
+		}
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrFailedTokenCreation, c))
 		return
 	}
@@ -355,7 +379,7 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
 	if mw.SendCookie {
 		c.SetCookie(mw.CookieName, "", -1, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
-		c.SetCookie(mw.RefreshTokenCookieName, "", -1, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
+		c.SetCookie(mw.RefreshTokenCookieName, "", -1, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
 	}
 	mw.LogoutResponse(c, http.StatusOK)
 }
@@ -371,12 +395,12 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	tokenPair, err := mw.TokenGenerator(c.Request.Context(), userData)
+	tokenPair, err := mw.generateTokenPair(userData)
 	if err != nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	if err := mw.TokenStore.Delete(c.Request.Context(), refreshToken); err != nil {
+	if err := mw.rotateRefreshToken(c.Request.Context(), refreshToken, tokenPair.RefreshToken, userData); err != nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
@@ -386,7 +410,22 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 }
 
 func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*core.Token, error) {
-	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
+	tokenPair, err := mw.generateTokenPair(data)
+	if err != nil {
+		return nil, err
+	}
+	err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, data, mw.TimeFunc().Add(mw.RefreshTokenTimeout))
+	if err != nil {
+		return nil, err
+	}
+	return tokenPair, nil
+}
+
+func (mw *ToukaJWTMiddleware) generateTokenPair(data any) (*core.Token, error) {
+	if mw.Key == nil {
+		return nil, ErrMissingPrivateKey
+	}
+	token := jwt.New(mw.algorithm.SigningMethod())
 	claims := token.Claims.(jwt.MapClaims)
 	if mw.PayloadFunc != nil {
 		for k, v := range mw.PayloadFunc(data) {
@@ -406,11 +445,6 @@ func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*co
 		return nil, err
 	}
 
-	err = mw.TokenStore.Set(ctx, refreshToken, data, mw.TimeFunc().Add(mw.RefreshTokenTimeout))
-	if err != nil {
-		return nil, err
-	}
-
 	return &core.Token{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
@@ -418,6 +452,23 @@ func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*co
 		CreatedAt:    mw.TimeFunc().Unix(),
 		TokenType:    "Bearer",
 	}, nil
+}
+
+func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
+	expiry := mw.TimeFunc().Add(mw.RefreshTokenTimeout)
+	if rotator, ok := mw.TokenStore.(core.RefreshTokenRotator); ok {
+		return rotator.Rotate(ctx, oldToken, newToken, userData, expiry)
+	}
+	if err := mw.TokenStore.Set(ctx, newToken, userData, expiry); err != nil {
+		return err
+	}
+	if err := mw.TokenStore.Delete(ctx, oldToken); err != nil {
+		if rmErr := mw.TokenStore.Delete(ctx, newToken); rmErr != nil {
+			log.Printf("WARN: refresh token rotation rollback failed: failed to delete old token: %v, failed to delete new token: %v, new token may be orphaned", err, rmErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
@@ -435,16 +486,10 @@ func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
 	if token := c.PostForm(mw.RefreshTokenCookieName); token != "" {
 		return token
 	}
-	if token := c.Query(mw.RefreshTokenCookieName); token != "" {
-		return token
-	}
 	return ""
 }
 
 func (mw *ToukaJWTMiddleware) signedString(token *jwt.Token) (string, error) {
-	if mw.usingPublicKeyAlgo() {
-		return token.SignedString(mw.privKey)
-	}
 	return token.SignedString(mw.Key)
 }
 
@@ -473,16 +518,20 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 	if token == "" {
 		return nil, ErrEmptyAuthHeader
 	}
-	return jwt.Parse(token, func(t *jwt.Token) (any, error) {
-		if jwt.GetSigningMethod(mw.SigningAlgorithm) != t.Method {
+	parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
+		if t.Method == nil || t.Method.Alg() != mw.algorithm.Alg() {
 			return nil, ErrInvalidSigningAlgorithm
 		}
-		if mw.usingPublicKeyAlgo() {
-			return mw.pubKey, nil
+		if mw.KeyFunc != nil {
+			return mw.KeyFunc(t)
 		}
-		c.Set("JWT_TOKEN", token)
-		return mw.Key, nil
+		return mw.verifyKey, nil
 	}, mw.ParseOptions...)
+	if err != nil {
+		return nil, err
+	}
+	c.Set("JWT_TOKEN", token)
+	return parsedToken, nil
 }
 
 func (mw *ToukaJWTMiddleware) jwtFromHeader(c *touka.Context, key string) string {
