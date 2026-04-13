@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"filippo.io/mldsa"
 	"github.com/fenthope/jwt"
 	"github.com/fenthope/jwt/core"
 	"github.com/infinite-iroha/touka"
@@ -50,16 +51,20 @@ func main() {
 
 func registerRoute(r *touka.Engine, handle *jwt.ToukaJWTMiddleware) {
 	r.POST("/login", handle.LoginHandler)
-	r.GET("/refresh_token", handle.RefreshHandler)
+	r.POST("/refresh_token", handle.RefreshHandler)
 
 	auth := r.Group("/auth", handle.MiddlewareFunc())
 	auth.GET("/hello", helloHandler)
 }
 
 func initParams() *jwt.ToukaJWTMiddleware {
+	privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
+	if err != nil {
+		log.Fatal(err)
+	}
 	return &jwt.ToukaJWTMiddleware{
 		Realm:       "test zone",
-		Key:         []byte("secret key"),
+		Key:         privateKey,
 		Timeout:     time.Hour,
 		MaxRefresh:  time.Hour * 24 * 7,
 		IdentityKey: identityKey,

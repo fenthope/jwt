@@ -10,15 +10,28 @@ import (
 )
 
 var _ core.TokenStore = &InMemoryRefreshTokenStore{}
+var _ core.RefreshTokenRotator = &InMemoryRefreshTokenStore{}
 
 type InMemoryRefreshTokenStore struct {
-	tokens map[string]*core.RefreshTokenData
-	mu     sync.RWMutex
+	tokens  map[string]*core.RefreshTokenData
+	mu      sync.RWMutex
+	nowFunc func() time.Time
 }
 
 func NewInMemoryRefreshTokenStore() *InMemoryRefreshTokenStore {
 	return &InMemoryRefreshTokenStore{
-		tokens: make(map[string]*core.RefreshTokenData),
+		tokens:  make(map[string]*core.RefreshTokenData),
+		nowFunc: time.Now,
+	}
+}
+
+func NewInMemoryRefreshTokenStoreWithClock(nowFunc func() time.Time) *InMemoryRefreshTokenStore {
+	if nowFunc == nil {
+		nowFunc = time.Now
+	}
+	return &InMemoryRefreshTokenStore{
+		tokens:  make(map[string]*core.RefreshTokenData),
+		nowFunc: nowFunc,
 	}
 }
 
@@ -31,7 +44,7 @@ func (s *InMemoryRefreshTokenStore) Set(ctx context.Context, token string, userD
 	s.tokens[token] = &core.RefreshTokenData{
 		UserData: userData,
 		Expiry:   expiry,
-		Created:  time.Now(),
+		Created:  s.nowFunc(),
 	}
 	return nil
 }
@@ -46,17 +59,17 @@ func (s *InMemoryRefreshTokenStore) Get(ctx context.Context, token string) (any,
 	if !exists {
 		return nil, core.ErrRefreshTokenNotFound
 	}
-	if data.IsExpired() {
+	if !s.nowFunc().Before(data.Expiry) {
 		s.mu.Lock()
 		// Double-check after acquiring write lock
-		if data, exists := s.tokens[token]; exists && data.IsExpired() {
+		if data, exists := s.tokens[token]; exists && !s.nowFunc().Before(data.Expiry) {
 			delete(s.tokens, token)
 			s.mu.Unlock()
-			return nil, core.ErrRefreshTokenNotFound
+			return nil, core.ErrRefreshTokenExpired
 		}
 		s.mu.Unlock()
 		// Token was already deleted or refreshed by another goroutine
-		return nil, core.ErrRefreshTokenNotFound
+		return nil, core.ErrRefreshTokenExpired
 	}
 	return data.UserData, nil
 }
@@ -71,13 +84,36 @@ func (s *InMemoryRefreshTokenStore) Delete(ctx context.Context, token string) er
 	return nil
 }
 
+func (s *InMemoryRefreshTokenStore) Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error {
+	if oldToken == "" || newToken == "" {
+		return errors.New("token cannot be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, exists := s.tokens[oldToken]
+	if !exists {
+		return core.ErrRefreshTokenNotFound
+	}
+	if !s.nowFunc().Before(data.Expiry) {
+		delete(s.tokens, oldToken)
+		return core.ErrRefreshTokenExpired
+	}
+	delete(s.tokens, oldToken)
+	s.tokens[newToken] = &core.RefreshTokenData{
+		UserData: userData,
+		Expiry:   expiry,
+		Created:  s.nowFunc(),
+	}
+	return nil
+}
+
 func (s *InMemoryRefreshTokenStore) Cleanup(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var cleaned int
-	now := time.Now()
+	now := s.nowFunc()
 	for token, data := range s.tokens {
-		if now.After(data.Expiry) {
+		if !now.Before(data.Expiry) {
 			delete(s.tokens, token)
 			cleaned++
 		}
@@ -88,7 +124,14 @@ func (s *InMemoryRefreshTokenStore) Cleanup(ctx context.Context) (int, error) {
 func (s *InMemoryRefreshTokenStore) Count(ctx context.Context) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.tokens), nil
+	var count int
+	now := s.nowFunc()
+	for _, data := range s.tokens {
+		if now.Before(data.Expiry) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (s *InMemoryRefreshTokenStore) Clear() {

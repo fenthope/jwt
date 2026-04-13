@@ -44,17 +44,26 @@ type ToukaJWTMiddleware struct {
 // cookie 配置
 	SendCookie bool
 	CookieName string
+	CookieMaxAge time.Duration
 	CookieDomain string
 	SecureCookie bool
 	CookieHTTPOnly bool
 	CookieSameSite http.SameSite
 
 	RefreshTokenCookieName string
-    RefreshTokenSecureCookie bool
-    RefreshTokenCookieHTTPOnly bool
+	RefreshTokenSecureCookie bool
+	RefreshTokenCookieHTTPOnly bool
 
-    // JWT 解析选项
-    ParseOptions []jwt.ParserOption
+// JWT 解析选项
+	ParseOptions []jwt.ParserOption
+	// 自定义时间函数，用于 token 过期时间计算
+	TimeFunc func() time.Time
+	// 禁用 abort
+	DisabledAbort bool
+	// 自定义 exp 字段名
+	ExpField string
+	// 是否在响应头中回传 Authorization 头
+	SendAuthorization bool
 
     // 密钥文件配置
     PrivKeyFile string
@@ -74,14 +83,20 @@ type Token struct {
 	AccessToken string `json:"access_token"`
 	TokenType string `json:"token_type"`
 	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresIn int64 `json:"expires_in"` // 剩余有效期（秒）
-	ExpiresAt string `json:"expires_at"` // RFC3339 格式过期时间
+	ExpiresAt int64 `json:"expires_at"` // Unix 时间戳（秒）
+	CreatedAt int64 `json:"created_at,omitempty"`
+	RefreshExpiresAt int64 `json:"refresh_expires_at,omitempty"` // refresh token 过期时间
+}
+
+// ExpiresIn() 方法返回剩余有效期（秒）
+func (t *Token) ExpiresIn() int64 {
+	return t.ExpiresAt - time.Now().Unix()
 }
 ```
 
-> 注意：`ExpiresIn` 是数值（秒），`ExpiresAt` 是 RFC3339 格式字符串。响应示例：
+> 注意：实际响应中 `expire` 字段为 RFC3339 格式字符串，例如：
 > ```json
-> {"access_token": "...", "refresh_token": "...", "expires_in": 3600, "expires_at": "2024-01-01T12:00:00Z"}
+> {"code": 200, "access_token": "...", "refresh_token": "...", "expire": "2024-01-01T12:00:00Z"}
 > ```
 
 ---
@@ -109,11 +124,10 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context)
 ```go
 // 默认 LoginResponse 格式
 {
-  "code": 200,
-  "access_token": "<jwt>",
-  "refresh_token": "<random_token>",
-  "expires_in": 3600,
-  "expires_at": "2024-01-01T12:00:00Z"
+"code": 200,
+"access_token": "<jwt>",
+"refresh_token": "<random_token>",
+"expire": "2024-01-01T12:00:00Z"
 }
 ```
 
@@ -122,7 +136,7 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context)
 1. 调用 `Authenticator(c)` 验证用户凭据
 2. 若认证失败，调用 `Unauthorized` 返回 401
 3. 调用 `TokenGenerator` 生成 token pair
-4. 调用 `SetCookie` 设置 access token cookie（若 `SendCookie` 为 true）
+4. 调用 `setAccessTokenCookie` 设置 access token cookie（若 `SendCookie` 为 true）
 5. 调用 `SetRefreshTokenCookie` 设置 refresh token cookie
 6. 调用 `LoginResponse` 返回响应
 
@@ -212,16 +226,17 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context)
 
 ### 内部流程
 
-1. 从 cookie 或 form body 提取 refresh token（`extractRefreshToken`）
+1. 从 cookie 或 form body（key 为 `RefreshTokenCookieName`，默认 `refresh_token`）提取 refresh token（`extractRefreshToken`）
 2. 若未找到 refresh token，返回 400
 3. 调用 `TokenStore.Get` 验证 refresh token 并获取关联的用户数据
 4. 若验证失败，返回 401
-5. 调用 `generateTokenPair` 生成新 token pair
-6. 调用 `rotateRefreshToken` 执行 refresh token rotation：
-   - 若 store 实现 `RefreshTokenRotator` 接口，调用原子 `Rotate`
-   - 否则执行 `Set(new) -> Delete(old)`，失败时回滚
-7. 设置新的 access token 和 refresh token cookie
-8. 调用 `RefreshResponse` 返回响应
+5. 验证 `MaxRefresh` 限制（若配置了 `MaxRefresh`）
+6. 调用 `generateTokenPair` 生成新 token pair
+7. 调用 `rotateRefreshToken` 执行 refresh token rotation：
+   - store 必须实现 `RefreshTokenRotator` 接口，并调用原子 `Rotate`
+   - 若未实现，则返回服务端错误并拒绝 refresh
+8. 设置新的 access token 和 refresh token cookie
+9. 调用 `RefreshResponse` 返回响应
 
 ### 使用示例
 
@@ -240,13 +255,13 @@ fetch("/refresh_token", {
 })
 ```
 
-客户端使用 form body 时：
+客户端使用 form body 时（key 为 `RefreshTokenCookieName`，默认 `refresh_token`）：
 
 ```go
 fetch("/refresh_token", {
-    method: "POST",
-    headers: {"Content-Type": "application/x-www-form-urlencoded"},
-    body: "refresh_token=xxx"
+method: "POST",
+headers: {"Content-Type": "application/x-www-form-urlencoded"},
+body: "refresh_token=xxx"
 })
 ```
 
@@ -286,8 +301,10 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 
 ### 内部流程
 
-1. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
-2. 调用 `LogoutResponse` 返回响应
+1. 从 cookie 或 form body 提取 refresh token
+2. 若找到 refresh token，遍历其完整刷新链（支持 refresh token rotation），从 `TokenStore` 中删除所有相关 token
+3. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
+4. 调用 `LogoutResponse` 返回响应
 
 ### 使用示例
 
@@ -295,18 +312,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 engine.POST("/logout", auth.LogoutHandler)
 ```
 
-注意：`LogoutHandler` 只清除客户端 cookie，不主动撤销服务器端的 refresh token（除非 store 有 TTL 过期机制）。如需主动撤销，应在调用 `LogoutHandler` 之前自行调用 `TokenStore.Delete`。
-
-```go
-engine.POST("/logout", func(c *touka.Context) {
-    // 手动撤销 refresh token
-    refreshToken, _ := c.GetCookie("refresh_token")
-    if refreshToken != "" {
-        auth.TokenStore.Delete(c.Request.Context(), refreshToken)
-    }
-    auth.LogoutHandler(c)
-})
-```
+注意：`LogoutHandler` 会自动遍历 refresh token 链并从 `TokenStore` 中删除所有相关 token，同时清除客户端 cookie。如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
 
 ---
 
@@ -332,9 +338,9 @@ func (mw *ToukaJWTMiddleware) MiddlewareFunc() touka.HandlerFunc
 
 ### 内部流程
 
-1. 调用 `ParseToken` 提取并解析 JWT
+1. 调用 `GetClaimsFromJWT` -> `ParseToken` 提取并解析 JWT
 2. 若解析失败，调用 `handleTokenError` 处理错误并终止
-3. 检查 `exp` 字段是否存在，不存在返回 400
+3. 验证 `exp` 字段：若缺失返回 400，若格式错误返回 400，若已过期返回 401
 4. 将 claims 存入 `c.Set("JWT_PAYLOAD", claims)`
 5. 调用 `IdentityHandler` 提取身份信息，存入 `c.Set(mw.IdentityKey, identity)`
 6. 调用 `Authorizator` 验证授权，失败返回 403
@@ -487,9 +493,10 @@ func New(mw *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error)
 | `TokenLookup` | `header:Authorization` |
 | `CookieName` | `jwt` |
 | `RefreshTokenCookieName` | `refresh_token` |
-| `RefreshTokenSecureCookie` | `true` |
-| `RefreshTokenCookieHTTPOnly` | `true` |
+| `RefreshTokenSecureCookie` | 仅当 `SendCookie` 为 true 时为 `true` |
+| `RefreshTokenCookieHTTPOnly` | 仅当 `SendCookie` 为 true 时为 `true` |
 | `TimeFunc` | `time.Now` |
+| `ExpField` | `"exp"` |
 | `Authorizator` | 始终返回 true |
 | `TokenStore` | 内存 store |
 | `Unauthorized` | 返回 JSON `{"code": <code>, "message": <message>}` |
@@ -595,3 +602,4 @@ func main() {
 | `ErrMissingPrivateKey` | 缺少私钥 |
 | `ErrExpiredToken` | token 已过期 |
 | `ErrMissingRefreshToken` | 缺少 refresh token |
+| `ErrInvalidTokenLookup` | 无效的 token lookup 配置 |

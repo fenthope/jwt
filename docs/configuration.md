@@ -12,17 +12,17 @@
 | `KeyFunc` | `func(token *jwt.Token) (any, error)` | 无 | 否 | 自定义密钥解析函数。用于在运行时动态确定验签密钥。若未设置，则使用 `verifyKey` |
 | `Timeout` | `time.Duration` | `time.Hour` | 否 | Access Token 有效期。`TimeoutFunc` 未设置时作为默认过期时长 |
 | `TimeoutFunc` | `func(data any) time.Duration` | 返回 `Timeout` 值 | 否 | 根据用户数据动态计算 Token 过期时长。用于实现不同用户不同过期时间 |
-| `MaxRefresh` | `time.Duration` | `time.Hour * 24 * 7` | 否 | Refresh Token 最大可刷新时间窗口。超过该时间后 Refresh Token 失效 |
-| `RefreshTokenTimeout` | `time.Duration` | 若 `MaxRefresh` 非零则为 `MaxRefresh`，否则 `time.Hour * 24 * 7` | 否 | Refresh Token 实际有效期 |
+| `MaxRefresh` | `time.Duration` | 无（零值） | 否 | Refresh Token 最大可刷新时间窗口。超过该时间后 Refresh Token 失效 |
+| `RefreshTokenTimeout` | `time.Duration` | 若未设置：若 `MaxRefresh` 非零则为 `MaxRefresh`，否则 `time.Hour * 24 * 7` | 否 | Refresh Token 实际有效期 |
 | `Authenticator` | `func(c *touka.Context) (any, error)` | 无 | 否* | 登录认证函数。接收请求上下文，返回用户标识数据。`LoginHandler` 必需此函数 |
 | `PayloadFunc` | `func(data any) MapClaims` | 无 | 否 | 自定义 Claims 填充函数。接收 `Authenticator` 返回的数据，返回要写入 Token 的 Claims |
 | `IdentityHandler` | `func(c *touka.Context) any` | 从 Claims 提取 `IdentityKey` | 否 | 从已解析的 Claims 中提取用户身份。默认使用 `IdentityKey` 字段名从 Claims 中取值 |
 | `IdentityKey` | `string` | `"identity"` | 否 | 用户身份在 Claims 中的字段名 |
 | `Authorizator` | `func(data any, c *touka.Context) bool` | 始终返回 `true` | 否 | 授权检查函数。接收用户身份数据和上下文，返回是否授权通过 |
 | `Unauthorized` | `func(c *touka.Context, code int, message string)` | JSON 返回 `{"code": <code>, "message": <message>}` | 否 | 认证/授权失败时的响应处理函数 |
-| `LoginResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 包含 access_token、refresh_token、expires_in、expires_at | 否 | 登录成功后的响应处理函数 |
+| `LoginResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 返回 `{"code": <code>, "access_token": <token>, "refresh_token": <token>, "expire": <RFC3339>}` | 否 | 登录成功后的响应处理函数 |
 | `LogoutResponse` | `func(c *touka.Context, code int)` | JSON 返回 `{"code": <code>}` | 否 | 登出成功后的响应处理函数 |
-| `RefreshResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 包含 access_token、refresh_token、expires_in、expires_at | 否 | Token 刷新成功后的响应处理函数 |
+| `RefreshResponse` | `func(c *touka.Context, code int, token *core.Token)` | JSON 返回 `{"code": <code>, "access_token": <token>, "refresh_token": <token>, "expire": <RFC3339>}` | 否 | Token 刷新成功后的响应处理函数 |
 | `HTTPStatusMessageFunc` | `func(e error, c *touka.Context) string` | 返回 `e.Error()` | 否 | 将错误转换为 HTTP 响应消息的函数 |
 | `TokenLookup` | `string` | `"header:Authorization"` | 否 | Access Token 提取位置。格式为 `"source:key"`，多个源用逗号分隔。source 可选：`header`、`query`、`cookie`、`param`、`form` |
 | `TokenHeadName` | `string` | `"Bearer"` | 否 | Authorization Header 前缀名。用于从 Header 提取 Token 时匹配前缀 |
@@ -30,21 +30,21 @@
 | `ExpField` | `string` | `"exp"` | 否 | Token 过期时间戳在 Claims 中的字段名 |
 | `SendCookie` | `bool` | `false` | 否 | 是否将 Access Token 和 Refresh Token 写入 Cookie |
 | `CookieName` | `string` | `"jwt"` | 否 | Access Token Cookie 名称 |
-| `CookieMaxAge` | `time.Duration` | 无 | 否 | Cookie 最大存活时间（未使用，代码中使用 `Timeout` 计算） |
+| `CookieMaxAge` | `time.Duration` | 无 | 否 | Cookie 最大存活时间。优先使用 `CookieMaxAge`；若未设置或 `<=0`，则回退到 `Timeout` |
 | `CookieDomain` | `string` | 空字符串 | 否 | Cookie 所属域名 |
 | `SecureCookie` | `bool` | `false` | 否 | Access Token Cookie 是否仅通过 HTTPS 发送 |
 | `CookieHTTPOnly` | `bool` | `false` | 否 | Access Token Cookie 是否禁止 JavaScript 访问 |
-| `CookieSameSite` | `http.SameSite` | `http.SameSiteNone`（`0`） | 否 | Cookie 的 SameSite 属性 |
+| `CookieSameSite` | `http.SameSite` | `0`（`http.SameSiteDefaultMode`） | 否 | Cookie 的 SameSite 属性。`0` 时框架不设置该属性 |
 | `RefreshTokenCookieName` | `string` | `"refresh_token"` | 否 | Refresh Token Cookie 名称 |
-| `RefreshTokenSecureCookie` | `bool` | `true` | 否 | Refresh Token Cookie 是否仅通过 HTTPS 发送 |
-| `RefreshTokenCookieHTTPOnly` | `bool` | `true` | 否 | Refresh Token Cookie 是否禁止 JavaScript 访问 |
+| `RefreshTokenSecureCookie` | `bool` | `false`（`SendCookie=true` 时为 `true`） | 否 | Refresh Token Cookie 是否仅通过 HTTPS 发送 |
+| `RefreshTokenCookieHTTPOnly` | `bool` | `false`（`SendCookie=true` 时为 `true`） | 否 | Refresh Token Cookie 是否禁止 JavaScript 访问 |
 | `PrivKeyFile` | `string` | 无 | 否 | 算法签名密钥文件路径。文件内容为算法所需的原始字节（`ML-DSA-65` 为 32 字节 seed） |
 | `PrivKeyBytes` | `[]byte` | 无 | 否 | 算法签名密钥字节数组。与 `PrivKeyFile` 二选一 |
 | `PubKeyFile` | `string` | 无 | 否 | 算法验签公钥文件路径。文件内容为算法所需的原始字节（`ML-DSA-65` 为 `mldsa.PublicKey.Bytes()` 输出） |
 | `PubKeyBytes` | `[]byte` | 无 | 否 | 算法验签公钥字节数组。与 `PubKeyFile` 二选一 |
 | `ParseOptions` | `[]jwt.ParserOption` | 无 | 否 | JWT 解析选项，透传给 `jwt.Parse` |
 | `SendAuthorization` | `bool` | `false` | 否 | 是否在响应 Header 中回传 Authorization 头 |
-| `TokenStore` | `core.TokenStore` | 内存存储 (`InMemoryRefreshTokenStore`) | 否 | Refresh Token 存储接口实现。生产环境应替换为分布式存储 |
+| `TokenStore` | `core.TokenStore` | 内存存储 (`InMemoryRefreshTokenStore`) | 否 | Refresh Token 存储接口实现。若要支持 `RefreshHandler`，store 必须实现 `core.RefreshTokenRotator` |
 | `DisabledAbort` | `bool` | `false` | 否 | 认证失败后是否阻止后续 Handler 执行。`true` 时不调用 `c.Abort()` |
 
 ## 密钥配置说明
@@ -99,13 +99,16 @@ source 可选值：
 
 ```go
 type Token struct {
-	AccessToken string
-	RefreshToken string
-	ExpiresIn int64  // 剩余有效期（秒）
-	ExpiresAt string // RFC3339 格式过期时间
-	TokenType string
+	AccessToken       string `json:"access_token"`
+	TokenType         string `json:"token_type"`
+	RefreshToken      string `json:"refresh_token,omitempty"`
+	ExpiresAt         int64  `json:"expires_at"`         // Unix 时间戳
+	CreatedAt         int64  `json:"created_at"`
+	RefreshExpiresAt  int64  `json:"refresh_expires_at,omitempty"` // Unix 时间戳
 }
 ```
+
+> 注意：默认 `LoginResponse` / `RefreshResponse` 中的 `"expire"` 字段是 `ExpiresAt` 转换的 RFC3339 格式字符串，**不是** 直接返回 `expires_at` 字段。`ExpiresIn` 不是结构体字段，而是通过 `Token.ExpiresIn()` 方法计算。`ExpiresIn()` 返回 `ExpiresAt - time.Now().Unix()`（剩余秒数）。
 
 ## 配置示例
 

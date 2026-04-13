@@ -10,74 +10,140 @@
 package main
 
 import (
-    "log"
-    "net/http"
-    "time"
+	"log"
+	"net/http"
+	"os"
+	"time"
 
-    "filippo.io/mldsa"
-    jwtmw "github.com/fenthope/jwt"
-    "github.com/infinite-iroha/touka"
+	"filippo.io/mldsa"
+	"github.com/fenthope/jwt"
+	"github.com/infinite-iroha/touka"
 )
 
-type loginRequest struct {
-    Username string `form:"username" binding:"required"`
-    Password string `form:"password" binding:"required"`
+type login struct {
+	Username string `form:"username" json:"username" binding:"required"`
+	Password string `form:"password" json:"password" binding:"required"`
+}
+
+type User struct {
+	UserName  string
+	FirstName string
+	LastName  string
 }
 
 func main() {
-    // 生成密钥（生产环境应持久化并共享密钥）
-    privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
-    if err != nil {
-        log.Fatal(err)
-    }
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8000"
+	}
 
-    // 创建中间件实例
-    authMiddleware, err := jwtmw.New(&jwtmw.ToukaJWTMiddleware{
-        Realm:       "api",
-        Key:         privateKey,
-        IdentityKey: "user_id",
-        Timeout:     time.Hour,
-        MaxRefresh:  7 * 24 * time.Hour, // refresh token 有效期 7 天
+	engine := touka.Default()
+	authMiddleware, err := jwt.New(initParams())
+	if err != nil {
+		log.Fatal("JWT Error:" + err.Error())
+	}
 
-        // 认证逻辑：从请求体中提取用户名密码并验证
-        Authenticator: func(c *touka.Context) (any, error) {
-            var req loginRequest
-            if err := c.ShouldBind(&req); err != nil {
-                return nil, jwtmw.ErrMissingLoginValues
-            }
-            // 实际项目中应查询数据库验证
-            if req.Username == "admin" && req.Password == "secret" {
-                return req.Username, nil
-            }
-            return nil, jwtmw.ErrFailedAuthentication
-        },
+	registerRoute(engine, authMiddleware)
 
-        // 自定义 Payload，包含用户标识
-        PayloadFunc: func(data any) jwtmw.MapClaims {
-            return jwtmw.MapClaims{"user_id": data}
-        },
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    engine := touka.Default()
-
-    // 注册路由
-    engine.POST("/login", authMiddleware.LoginHandler)
-    engine.POST("/refresh_token", authMiddleware.RefreshHandler)
-
-    // 受保护的路由组
-    auth := engine.Group("/api", authMiddleware.MiddlewareFunc())
-    auth.GET("/profile", profileHandler)
-
-    log.Fatal(http.ListenAndServe(":8080", engine))
+	if err = http.ListenAndServe(":"+port, engine); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func profileHandler(c *touka.Context) {
-    // 从上下文中获取当前用户
-    userID, _ := c.Get("user_id")
-    c.JSON(200, touka.H{"user_id": userID})
+func registerRoute(r *touka.Engine, handle *jwt.ToukaJWTMiddleware) {
+	r.POST("/login", handle.LoginHandler)
+	r.POST("/refresh_token", handle.RefreshHandler)
+
+	auth := r.Group("/auth", handle.MiddlewareFunc())
+	auth.GET("/hello", helloHandler)
+}
+
+func initParams() *jwt.ToukaJWTMiddleware {
+	privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &jwt.ToukaJWTMiddleware{
+		Realm:       "test zone",
+		Key:         privateKey,
+		Timeout:     time.Hour,
+		MaxRefresh:  time.Hour * 24 * 7,
+		IdentityKey: "id",
+		PayloadFunc: payloadFunc(),
+		IdentityHandler: identityHandler(),
+		Authenticator: authenticator(),
+		Authorizator: authorizator(),
+		Unauthorized: unauthorized(),
+		TokenLookup:  "header: Authorization, query: token, cookie: jwt",
+		TokenHeadName: "Bearer",
+		TimeFunc: time.Now,
+	}
+}
+
+func payloadFunc() func(data any) jwt.MapClaims {
+	return func(data any) jwt.MapClaims {
+		if v, ok := data.(*User); ok {
+			return jwt.MapClaims{"id": v.UserName}
+		}
+		return jwt.MapClaims{}
+	}
+}
+
+func identityHandler() func(c *touka.Context) any {
+	return func(c *touka.Context) any {
+		claims := jwt.ExtractClaims(c)
+		return &User{
+			UserName: claims["id"].(string),
+		}
+	}
+}
+
+func authenticator() func(c *touka.Context) (any, error) {
+	return func(c *touka.Context) (any, error) {
+		var loginVals login
+		if err := c.ShouldBind(&loginVals); err != nil {
+			return "", jwt.ErrMissingLoginValues
+		}
+		userID := loginVals.Username
+		password := loginVals.Password
+
+		if (userID == "admin" && password == "admin") || (userID == "test" && password == "test") {
+			return &User{
+				UserName: userID,
+				LastName: "Bo-Yi",
+				FirstName: "Wu",
+			}, nil
+		}
+		return nil, jwt.ErrFailedAuthentication
+	}
+}
+
+func authorizator() func(data any, c *touka.Context) bool {
+	return func(data any, c *touka.Context) bool {
+		if v, ok := data.(*User); ok && v.UserName == "admin" {
+			return true
+		}
+		return false
+	}
+}
+
+func unauthorized() func(c *touka.Context, code int, message string) {
+	return func(c *touka.Context, code int, message string) {
+		c.JSON(code, touka.H{
+			"code":    code,
+			"message": message,
+		})
+	}
+}
+
+func helloHandler(c *touka.Context) {
+	claims := jwt.ExtractClaims(c)
+	user, _ := c.Get("id")
+	c.JSON(200, touka.H{
+		"userID":   claims["id"],
+		"userName": user.(*User).UserName,
+		"text":     "Hello World.",
+	})
 }
 ```
 
@@ -85,12 +151,12 @@ func profileHandler(c *touka.Context) {
 
 ```sh
 # 登录
-curl -X POST http://localhost:8080/login \
-  -d "username=admin&password=secret"
+curl -X POST http://localhost:8000/login \
+-d "username=admin&password=admin"
 
 # 访问受保护接口（需要 access_token）
-curl http://localhost:8080/api/profile \
-  -H "Authorization: Bearer <access_token>"
+curl http://localhost:8000/auth/hello \
+-H "Authorization: Bearer <access_token>"
 ```
 
 ## 2. Verify-Only Mode

@@ -82,11 +82,11 @@ Refresh token 是长期 bearer secret，放在 URL 中存在以下风险：
 - **Referer 头传递**：跳转到第三方页面时自动携带完整 URL
 - **缓存污染**：代理服务器可能缓存包含 token 的 URL
 
-Touka JWT Middleware 的 `extractRefreshToken` 方法（`auth_jwt.go:479`）明确只从 cookie 和 form body 提取 token，不从 query string 读取，这是正确的设计。
+Touka JWT Middleware 的 `extractRefreshToken` 方法（`auth_jwt.go:662-670`）明确只从 cookie 和 form body 提取 token，不从 query string 读取，这是正确的设计。
 
 ### 2.2 Cookie + Form 的提取方式
 
-Refresh token 提取顺序（`auth_jwt.go:479-487`）：
+Refresh token 提取顺序（`auth_jwt.go:662-670`）：
 
 ```go
 func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
@@ -110,29 +110,38 @@ func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
 
 Refresh token rotation 是指每次 refresh 时颁发新 token 并使旧 token 失效。这能限制被盗 token 的有效期。
 
-Touka JWT Middleware 的处理逻辑（`auth_jwt.go:456-469`）：
+Touka JWT Middleware 的处理逻辑（`auth_jwt.go:514-548`）：
 
 ```go
 func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
-    expiry := mw.TimeFunc().Add(mw.RefreshTokenTimeout)
-    if rotator, ok := mw.TokenStore.(core.RefreshTokenRotator); ok {
-        return rotator.Rotate(ctx, oldToken, newToken, userData, expiry)
-    }
-    // 回退逻辑：Set -> Delete，回滚时 Delete(new)
-    if err := mw.TokenStore.Set(ctx, newToken, userData, expiry); err != nil {
-        return err
-    }
-    if err := mw.TokenStore.Delete(ctx, oldToken); err != nil {
-        _ = mw.TokenStore.Delete(ctx, newToken)
-        return err
-    }
-    return nil
+	unlock := acquireRefreshTokenLock(oldToken)
+	defer unlock()
+	currentToken, err := mw.TokenStore.Get(ctx, oldToken)
+	if err != nil {
+		return err
+	}
+	currentToken = mw.normalizeRefreshTokenState(currentToken)
+	if currentToken == nil {
+		return core.ErrRefreshTokenNotFound
+	}
+	if err := mw.validateRefreshTokenState(currentToken); err != nil {
+		return err
+	}
+	expiry := mw.refreshTokenExpiry(currentToken)
+	if rotator, ok := mw.TokenStore.(core.RefreshTokenRotator); ok {
+		if err := rotator.Rotate(ctx, oldToken, newToken, currentToken, expiry); err != nil {
+			return err
+		}
+		setRefreshTokenSuccessor(oldToken, newToken)
+		return nil
+	}
+	return ErrUnsafeRefreshRotation
 }
 ```
 
-**关键风险**：非原子操作会导致中间状态——新 token 已写入、旧 token 尚未删除。如果此时进程崩溃或 Delete 失败，会留下一个窗口期，两个 token 都有效。
+**关键要求**：refresh token rotation 必须是原子的。中间件不再接受非原子的 `Set(new) -> Delete(old)` 回退流程，因为这会产生新旧 token 同时有效的窗口。
 
-**推荐做法**：TokenStore 实现 `core.RefreshTokenRotator` 接口，提供原子 `Rotate` 操作。内置的 `InMemoryRefreshTokenStore` 已实现此接口（`store/memory.go:13`）。
+**推荐做法**：TokenStore 实现 `core.RefreshTokenRotator` 接口，提供原子 `Rotate` 操作。内置的 `InMemoryRefreshTokenStore` 已实现此接口（`store/memory.go:13`）。如果自定义 store 未实现该接口，`RefreshHandler` 会直接拒绝 refresh 请求。
 
 ### 2.4 长期 Token 的风险
 
@@ -174,7 +183,7 @@ RefreshTokenCookieHTTPOnly: true,  // 启用后 JS 无法访问
 
 这是对抗 XSS 攻击的核心防线。即使攻击者能在页面执行 JS，也无法直接获取 refresh token。
 
-注意： Touka JWT Middleware 对 refresh token cookie 默认设置为 `RefreshTokenSecureCookie: true` 和 `RefreshTokenCookieHTTPOnly: true`（`auth_jwt.go:144-146`）。
+注意：当 `SendCookie: true` 时，Touka JWT Middleware 仅针对 **RefreshToken cookie** 自动设置 `RefreshTokenSecureCookie: true` 和 `RefreshTokenCookieHTTPOnly: true`（`auth_jwt.go:165-168`）。普通 access token cookie 的 `SecureCookie` 和 `CookieHTTPOnly` 不会被自动设置，如需启用请手动配置。
 
 ### 3.3 CookieSameSite
 
@@ -303,13 +312,15 @@ mw := &jwtmw.ToukaJWTMiddleware{
     Timeout:            time.Minute * 15,
     RefreshTokenTimeout: time.Hour * 24 * 7,
 
-    // Cookie 安全配置
-    SendCookie:                  true,
-    CookieHTTPOnly:              true,
-    SecureCookie:                true,           // 生产环境必须为 true
-    CookieSameSite:              http.SameSiteStrictMode,
-    RefreshTokenSecureCookie:    true,
-    RefreshTokenCookieHTTPOnly:  true,
+// Cookie 安全配置
+SendCookie: true,
+// 当 SendCookie: true 时，RefreshTokenSecureCookie 和 RefreshTokenCookieHTTPOnly 会自动设为 true，
+// 以下两行可省略（此处仅为明确展示完整配置）
+RefreshTokenSecureCookie: true, // 已自动设置，此处显式声明
+RefreshTokenCookieHTTPOnly: true, // 已自动设置，此处显式声明
+CookieHTTPOnly: true,
+SecureCookie: true, // 生产环境必须为 true
+CookieSameSite: http.SameSiteStrictMode,
 
     // Store 配置
     TokenStore: myProductionTokenStore, // 替换默认内存 store

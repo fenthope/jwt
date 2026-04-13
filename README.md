@@ -13,6 +13,14 @@ Touka 的 JWT 中间件。
 - refresh token 默认存储：内存 `TokenStore`
 - refresh token 提取顺序：cookie，然后 form
 - 示例 refresh endpoint：`POST /refresh_token`
+- `TokenLookup`：`header:Authorization`
+- `Timeout`：`time.Hour`
+- `TimeFunc`：`time.Now`
+- `IdentityKey`：`identity`
+- `TokenHeadName`：`Bearer`
+- `ExpField`：`exp`
+- `CookieName`：`jwt`
+- `RefreshTokenCookieName`：`refresh_token`
 
 ## Breaking Changes
 
@@ -126,7 +134,7 @@ refresh token 是长期 bearer secret，不应该放在 URL 里。
 
 推荐使用 `POST` + cookie 或 `POST` + form，不要把 refresh token 放到 query string。
 
-为了尽量避免 refresh rotation 的中间不一致状态，store 可以额外实现 `core.RefreshTokenRotator`：
+`RefreshHandler` 要求 `TokenStore` 实现原子 refresh rotation。为此，store 必须实现 `core.RefreshTokenRotator`：
 
 ```go
 type RefreshTokenRotator interface {
@@ -135,7 +143,7 @@ type RefreshTokenRotator interface {
 }
 ```
 
-如果 store 实现了这个接口，中间件会优先走原子 `Rotate`。如果没有实现，会回退到 `Set(new) -> Delete(old)`，并在 `Delete(old)` 失败时回滚 `Delete(new)`。
+如果 store 没有实现这个接口，`RefreshHandler` 会返回错误而不是回退到非原子 `Set(new) -> Delete(old)` 流程。默认内存 store 已实现该接口。
 
 ## Example App
 

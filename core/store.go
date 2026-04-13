@@ -32,6 +32,14 @@ type TokenStore interface {
 	Count(ctx context.Context) (int, error)
 }
 
+// RefreshTokenRotator atomically swaps an old refresh token for a new one.
+// Stores that implement this can avoid inconsistent intermediate states during
+// refresh-token rotation.
+type RefreshTokenRotator interface {
+	TokenStore
+	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+}
+
 // RefreshTokenData holds the data stored with each refresh token
 type RefreshTokenData struct {
 	UserData any       `json:"user_data"`
@@ -39,18 +47,26 @@ type RefreshTokenData struct {
 	Created  time.Time `json:"created"`
 }
 
+// RefreshTokenState stores refresh-token lifecycle metadata that may need to
+// survive custom TokenStore serialization.
+type RefreshTokenState struct {
+	UserData        any       `json:"user_data"`
+	MaxRefreshUntil time.Time `json:"max_refresh_until,omitempty"`
+}
+
 // IsExpired checks if the token data has expired
 func (r *RefreshTokenData) IsExpired() bool {
-	return time.Now().After(r.Expiry)
+	return !time.Now().Before(r.Expiry)
 }
 
 // Token represents a complete JWT token pair with metadata
 type Token struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresAt    int64  `json:"expires_at"`
-	CreatedAt    int64  `json:"created_at"`
+	AccessToken      string `json:"access_token"`
+	TokenType        string `json:"token_type"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	ExpiresAt        int64  `json:"expires_at"`
+	CreatedAt        int64  `json:"created_at"`
+	RefreshExpiresAt int64  `json:"refresh_expires_at,omitempty"`
 }
 
 // ExpiresIn returns the number of seconds until the access token expires

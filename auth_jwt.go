@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fenthope/jwt/core"
@@ -18,6 +19,21 @@ import (
 )
 
 type MapClaims jwt.MapClaims
+
+type tokenLookupSource struct {
+	kind string
+	name string
+}
+
+type refreshTokenLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+type refreshTokenChainEntry struct {
+	next   string
+	expiry time.Time
+}
 
 type ToukaJWTMiddleware struct {
 	Realm string
@@ -79,6 +95,7 @@ type ToukaJWTMiddleware struct {
 	algorithm     Algorithm
 	verifyKey     any
 	inMemoryStore *store.InMemoryRefreshTokenStore
+	tokenSources  []tokenLookupSource
 }
 
 var (
@@ -102,6 +119,16 @@ var (
 	ErrMissingPrivateKey        = errors.New("private key is missing")
 	ErrExpiredToken             = errors.New("token is expired")
 	ErrMissingRefreshToken      = errors.New("refresh token is missing")
+	ErrUnsafeRefreshRotation    = errors.New("token store must implement RefreshTokenRotator for refresh rotation")
+	ErrInvalidTokenLookup       = errors.New("token lookup is invalid")
+
+	refreshTokenLocksMu sync.Mutex
+	refreshTokenLocks   = map[string]*refreshTokenLockEntry{}
+
+	refreshTokenChainMu      sync.Mutex
+	refreshTokenChain        = map[string]refreshTokenChainEntry{}
+	refreshTokenChainSweeps  int
+	refreshTokenChainSweepAt = 64
 )
 
 func New(mw *ToukaJWTMiddleware) (*ToukaJWTMiddleware, error) {
@@ -142,9 +169,10 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	if mw.RefreshTokenCookieName == "" {
 		mw.RefreshTokenCookieName = "refresh_token"
 	}
-	// Refresh token cookie security defaults to true for enhanced security
-	mw.RefreshTokenSecureCookie = true
-	mw.RefreshTokenCookieHTTPOnly = true
+	if mw.SendCookie {
+		mw.RefreshTokenSecureCookie = true
+		mw.RefreshTokenCookieHTTPOnly = true
+	}
 	if mw.RefreshTokenTimeout == 0 {
 		if mw.MaxRefresh != 0 {
 			mw.RefreshTokenTimeout = mw.MaxRefresh
@@ -202,9 +230,15 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	}
 
 	if mw.TokenStore == nil {
-		mw.inMemoryStore = store.NewInMemoryRefreshTokenStore()
+		mw.inMemoryStore = store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)
 		mw.TokenStore = mw.inMemoryStore
 	}
+
+	sources, err := parseTokenLookupSources(mw.TokenLookup)
+	if err != nil {
+		return err
+	}
+	mw.tokenSources = sources
 
 	if mw.Realm == "" {
 		return ErrMissingRealm
@@ -323,8 +357,12 @@ func (mw *ToukaJWTMiddleware) middlewareImpl(c *touka.Context) {
 		mw.handleTokenError(c, err)
 		return
 	}
-	if claims[mw.ExpField] == nil {
-		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingExpField, c))
+	if err := mw.validateClaimsExpiry(claims); err != nil {
+		if errors.Is(err, ErrMissingExpField) || errors.Is(err, ErrWrongFormatOfExp) {
+			mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(err, c))
+			return
+		}
+		mw.handleTokenError(c, err)
 		return
 	}
 	c.Set("JWT_PAYLOAD", claims)
@@ -371,15 +409,39 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrFailedTokenCreation, c))
 		return
 	}
-	mw.SetCookie(c, tokenPair.AccessToken)
-	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken)
+	mw.setAccessTokenCookie(c, tokenPair.AccessToken, tokenPair.ExpiresAt)
+	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken, tokenPair.RefreshExpiresAt)
 	mw.LoginResponse(c, http.StatusOK, tokenPair)
 }
 
 func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
+	refreshToken := mw.extractRefreshToken(c)
+	if refreshToken != "" {
+		token := refreshToken
+		unlock := acquireRefreshTokenLock(token)
+		for token != "" {
+			next := nextRefreshToken(token, mw.TimeFunc())
+			var nextUnlock func()
+			if next != "" {
+				nextUnlock = acquireRefreshTokenLock(next)
+			}
+			if err := mw.TokenStore.Delete(c.Request.Context(), token); err != nil && !errors.Is(err, core.ErrRefreshTokenNotFound) && !errors.Is(err, core.ErrRefreshTokenExpired) {
+				if nextUnlock != nil {
+					nextUnlock()
+				}
+				unlock()
+				mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
+				return
+			}
+			deleteRefreshTokenSuccessor(token)
+			unlock()
+			unlock = nextUnlock
+			token = next
+		}
+	}
 	if mw.SendCookie {
-		c.SetCookie(mw.CookieName, "", -1, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
-		c.SetCookie(mw.RefreshTokenCookieName, "", -1, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
+		mw.writeCookie(c, mw.CookieName, "", -1, mw.SecureCookie, mw.CookieHTTPOnly)
+		mw.writeCookie(c, mw.RefreshTokenCookieName, "", -1, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
 	}
 	mw.LogoutResponse(c, http.StatusOK)
 }
@@ -395,17 +457,27 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	tokenPair, err := mw.generateTokenPair(userData)
+	userData = mw.normalizeRefreshTokenState(userData)
+	if err := mw.validateRefreshTokenState(userData); err != nil {
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
+		return
+	}
+	tokenPair, err := mw.generateTokenPair(mw.refreshTokenUserData(userData))
 	if err != nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
+	tokenPair.RefreshExpiresAt = mw.refreshTokenExpiry(userData).Unix()
 	if err := mw.rotateRefreshToken(c.Request.Context(), refreshToken, tokenPair.RefreshToken, userData); err != nil {
+		if errors.Is(err, core.ErrRefreshTokenExpired) || errors.Is(err, core.ErrRefreshTokenNotFound) {
+			mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
+			return
+		}
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	mw.SetCookie(c, tokenPair.AccessToken)
-	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken)
+	mw.setAccessTokenCookie(c, tokenPair.AccessToken, tokenPair.ExpiresAt)
+	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken, tokenPair.RefreshExpiresAt)
 	mw.RefreshResponse(c, http.StatusOK, tokenPair)
 }
 
@@ -414,7 +486,9 @@ func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*co
 	if err != nil {
 		return nil, err
 	}
-	err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, data, mw.TimeFunc().Add(mw.RefreshTokenTimeout))
+	storedToken := mw.newRefreshTokenState(data)
+	tokenPair.RefreshExpiresAt = mw.refreshTokenExpiry(storedToken).Unix()
+	err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, storedToken, time.Unix(tokenPair.RefreshExpiresAt, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -446,29 +520,38 @@ func (mw *ToukaJWTMiddleware) generateTokenPair(data any) (*core.Token, error) {
 	}
 
 	return &core.Token{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresAt:    expire.Unix(),
-		CreatedAt:    mw.TimeFunc().Unix(),
-		TokenType:    "Bearer",
+		AccessToken:      accessToken,
+		RefreshToken:     refreshToken,
+		ExpiresAt:        expire.Unix(),
+		CreatedAt:        mw.TimeFunc().Unix(),
+		TokenType:        "Bearer",
+		RefreshExpiresAt: mw.refreshTokenExpiry(mw.newRefreshTokenState(data)).Unix(),
 	}, nil
 }
 
 func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
-	expiry := mw.TimeFunc().Add(mw.RefreshTokenTimeout)
+	unlock := acquireRefreshTokenLock(oldToken)
+	defer unlock()
+	currentToken, err := mw.TokenStore.Get(ctx, oldToken)
+	if err != nil {
+		return err
+	}
+	currentToken = mw.normalizeRefreshTokenState(currentToken)
+	if currentToken == nil {
+		return core.ErrRefreshTokenNotFound
+	}
+	if err := mw.validateRefreshTokenState(currentToken); err != nil {
+		return err
+	}
+	expiry := mw.refreshTokenExpiry(currentToken)
 	if rotator, ok := mw.TokenStore.(core.RefreshTokenRotator); ok {
-		return rotator.Rotate(ctx, oldToken, newToken, userData, expiry)
-	}
-	if err := mw.TokenStore.Set(ctx, newToken, userData, expiry); err != nil {
-		return err
-	}
-	if err := mw.TokenStore.Delete(ctx, oldToken); err != nil {
-		if rmErr := mw.TokenStore.Delete(ctx, newToken); rmErr != nil {
-			log.Printf("WARN: refresh token rotation rollback failed: failed to delete old token: %v, failed to delete new token: %v, new token may be orphaned", err, rmErr)
+		if err := rotator.Rotate(ctx, oldToken, newToken, currentToken, expiry); err != nil {
+			return err
 		}
-		return err
+		setRefreshTokenSuccessor(oldToken, newToken, expiry, mw.TimeFunc())
+		return nil
 	}
-	return nil
+	return ErrUnsafeRefreshRotation
 }
 
 func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
@@ -477,6 +560,110 @@ func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
 		return "", err
 	}
 	return base64.URLEncoding.EncodeToString(token), nil
+}
+
+func (mw *ToukaJWTMiddleware) newRefreshTokenState(userData any) any {
+	if mw.MaxRefresh == 0 {
+		return userData
+	}
+	return core.RefreshTokenState{
+		UserData:        userData,
+		MaxRefreshUntil: mw.TimeFunc().Add(mw.MaxRefresh),
+	}
+}
+
+func (mw *ToukaJWTMiddleware) normalizeRefreshTokenState(userData any) any {
+	switch v := userData.(type) {
+	case core.RefreshTokenState:
+		return v
+	case *core.RefreshTokenState:
+		if v == nil {
+			return nil
+		}
+		return *v
+	case map[string]any:
+		state, ok := parseRefreshTokenStateMap(v)
+		if ok {
+			return state
+		}
+		return userData
+	default:
+		state, ok := parseRefreshTokenStateJSON(userData)
+		if ok {
+			return state
+		}
+		return userData
+	}
+}
+
+func (mw *ToukaJWTMiddleware) refreshTokenUserData(userData any) any {
+	switch v := userData.(type) {
+	case core.RefreshTokenState:
+		return v.UserData
+	case *core.RefreshTokenState:
+		if v == nil {
+			return nil
+		}
+		return v.UserData
+	default:
+		return userData
+	}
+}
+
+func (mw *ToukaJWTMiddleware) validateRefreshTokenState(userData any) error {
+	switch v := userData.(type) {
+	case core.RefreshTokenState:
+		if !v.MaxRefreshUntil.IsZero() && !mw.TimeFunc().Before(v.MaxRefreshUntil) {
+			return core.ErrRefreshTokenExpired
+		}
+	case *core.RefreshTokenState:
+		if v != nil && !v.MaxRefreshUntil.IsZero() && !mw.TimeFunc().Before(v.MaxRefreshUntil) {
+			return core.ErrRefreshTokenExpired
+		}
+	}
+	return nil
+}
+
+func (mw *ToukaJWTMiddleware) refreshTokenExpiry(userData any) time.Time {
+	expiry := mw.TimeFunc().Add(mw.RefreshTokenTimeout)
+	switch v := userData.(type) {
+	case core.RefreshTokenState:
+		if !v.MaxRefreshUntil.IsZero() && v.MaxRefreshUntil.Before(expiry) {
+			return v.MaxRefreshUntil
+		}
+	case *core.RefreshTokenState:
+		if v != nil && !v.MaxRefreshUntil.IsZero() && v.MaxRefreshUntil.Before(expiry) {
+			return v.MaxRefreshUntil
+		}
+	}
+	return expiry
+}
+
+func parseTokenLookupSources(tokenLookup string) ([]tokenLookupSource, error) {
+	methods := strings.Split(tokenLookup, ",")
+	sources := make([]tokenLookupSource, 0, len(methods))
+	for _, method := range methods {
+		method = strings.TrimSpace(method)
+		parts := strings.SplitN(method, ":", 2)
+		if len(parts) != 2 {
+			return nil, ErrInvalidTokenLookup
+		}
+		kind := strings.TrimSpace(parts[0])
+		name := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, ErrInvalidTokenLookup
+		}
+		switch kind {
+		case "header", "query", "cookie", "param", "form":
+		default:
+			return nil, ErrInvalidTokenLookup
+		}
+		sources = append(sources, tokenLookupSource{kind: kind, name: name})
+	}
+	if len(sources) == 0 {
+		return nil, ErrInvalidTokenLookup
+	}
+	return sources, nil
 }
 
 func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
@@ -495,24 +682,21 @@ func (mw *ToukaJWTMiddleware) signedString(token *jwt.Token) (string, error) {
 
 func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 	var token string
-	methods := strings.Split(mw.TokenLookup, ",")
-	for _, method := range methods {
+	for _, source := range mw.tokenSources {
 		if len(token) > 0 {
 			break
 		}
-		parts := strings.Split(strings.TrimSpace(method), ":")
-		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-		switch k {
+		switch source.kind {
 		case "header":
-			token = mw.jwtFromHeader(c, v)
+			token = mw.jwtFromHeader(c, source.name)
 		case "query":
-			token = c.Query(v)
+			token = c.Query(source.name)
 		case "cookie":
-			token, _ = c.GetCookie(v)
+			token, _ = c.GetCookie(source.name)
 		case "param":
-			token = c.Param(v)
+			token = c.Param(source.name)
 		case "form":
-			token = c.PostForm(v)
+			token = c.PostForm(source.name)
 		}
 	}
 	if token == "" {
@@ -526,7 +710,7 @@ func (mw *ToukaJWTMiddleware) ParseToken(c *touka.Context) (*jwt.Token, error) {
 			return mw.KeyFunc(t)
 		}
 		return mw.verifyKey, nil
-	}, mw.ParseOptions...)
+	}, mw.parserOptions()...)
 	if err != nil {
 		return nil, err
 	}
@@ -550,9 +734,54 @@ func (mw *ToukaJWTMiddleware) handleTokenError(c *touka.Context, err error) {
 	switch {
 	case errors.Is(err, jwt.ErrTokenExpired):
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrExpiredToken, c))
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 	default:
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 	}
+}
+
+func (mw *ToukaJWTMiddleware) validateClaimsExpiry(claims jwt.MapClaims) error {
+	rawExp := claims[mw.ExpField]
+	if rawExp == nil {
+		return ErrMissingExpField
+	}
+	exp, err := parseNumericDate(rawExp)
+	if err != nil {
+		return ErrWrongFormatOfExp
+	}
+	if !mw.TimeFunc().Before(exp) {
+		return jwt.ErrTokenExpired
+	}
+	return nil
+}
+
+func parseNumericDate(value any) (time.Time, error) {
+	switch v := value.(type) {
+	case float64:
+		return time.Unix(int64(v), 0), nil
+	case float32:
+		return time.Unix(int64(v), 0), nil
+	case int64:
+		return time.Unix(v, 0), nil
+	case int32:
+		return time.Unix(int64(v), 0), nil
+	case int:
+		return time.Unix(int64(v), 0), nil
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return time.Time{}, err
+		}
+		return time.Unix(n, 0), nil
+	default:
+		return time.Time{}, ErrWrongFormatOfExp
+	}
+}
+
+func (mw *ToukaJWTMiddleware) parserOptions() []jwt.ParserOption {
+	options := []jwt.ParserOption{jwt.WithTimeFunc(mw.TimeFunc)}
+	return append(options, mw.ParseOptions...)
 }
 
 func (mw *ToukaJWTMiddleware) unauthorized(c *touka.Context, code int, message string) {
@@ -566,14 +795,159 @@ func (mw *ToukaJWTMiddleware) unauthorized(c *touka.Context, code int, message s
 func (mw *ToukaJWTMiddleware) SetCookie(c *touka.Context, token string) {
 	if mw.SendCookie {
 		maxage := int(mw.Timeout.Seconds())
-		c.SetCookie(mw.CookieName, token, maxage, "/", mw.CookieDomain, mw.SecureCookie, mw.CookieHTTPOnly)
+		if mw.CookieMaxAge > 0 {
+			maxage = int(mw.CookieMaxAge.Seconds())
+		}
+		mw.writeCookie(c, mw.CookieName, token, maxage, mw.SecureCookie, mw.CookieHTTPOnly)
 	}
 }
 
-func (mw *ToukaJWTMiddleware) SetRefreshTokenCookie(c *touka.Context, token string) {
+func (mw *ToukaJWTMiddleware) setAccessTokenCookie(c *touka.Context, token string, expiresAt int64) {
+	if !mw.SendCookie {
+		return
+	}
+	maxage := int(mw.Timeout.Seconds())
+	if mw.CookieMaxAge > 0 {
+		maxage = int(mw.CookieMaxAge.Seconds())
+	} else if expiresAt > 0 {
+		remaining := expiresAt - mw.TimeFunc().Unix()
+		if remaining < 0 {
+			remaining = 0
+		}
+		maxage = int(remaining)
+	}
+	mw.writeCookie(c, mw.CookieName, token, maxage, mw.SecureCookie, mw.CookieHTTPOnly)
+}
+
+func (mw *ToukaJWTMiddleware) SetRefreshTokenCookie(c *touka.Context, token string, refreshExpiresAt ...int64) {
 	if mw.SendCookie {
 		maxage := int(mw.RefreshTokenTimeout.Seconds())
-		c.SetCookie(mw.RefreshTokenCookieName, token, maxage, "/", mw.CookieDomain, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
+		if len(refreshExpiresAt) > 0 && refreshExpiresAt[0] > 0 {
+			remaining := refreshExpiresAt[0] - mw.TimeFunc().Unix()
+			if remaining < 0 {
+				remaining = 0
+			}
+			maxage = int(remaining)
+		}
+		mw.writeCookie(c, mw.RefreshTokenCookieName, token, maxage, mw.RefreshTokenSecureCookie, mw.RefreshTokenCookieHTTPOnly)
+	}
+}
+
+func (mw *ToukaJWTMiddleware) writeCookie(c *touka.Context, name, token string, maxage int, secure, httpOnly bool) {
+	if mw.CookieSameSite != 0 {
+		c.SetSameSite(mw.CookieSameSite)
+	}
+	c.SetCookie(name, token, maxage, "/", mw.CookieDomain, secure, httpOnly)
+}
+
+func acquireRefreshTokenLock(token string) func() {
+	refreshTokenLocksMu.Lock()
+	entry := refreshTokenLocks[token]
+	if entry == nil {
+		entry = &refreshTokenLockEntry{}
+		refreshTokenLocks[token] = entry
+	}
+	entry.refs++
+	refreshTokenLocksMu.Unlock()
+
+	entry.mu.Lock()
+
+	return func() {
+		entry.mu.Unlock()
+		refreshTokenLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(refreshTokenLocks, token)
+		}
+		refreshTokenLocksMu.Unlock()
+	}
+}
+
+func setRefreshTokenSuccessor(oldToken, newToken string, expiry, now time.Time) {
+	refreshTokenChainMu.Lock()
+	refreshTokenChain[oldToken] = refreshTokenChainEntry{next: newToken, expiry: expiry}
+	refreshTokenChainSweeps++
+	if refreshTokenChainSweeps >= refreshTokenChainSweepAt {
+		sweepExpiredRefreshTokenSuccessorsLocked(now)
+		refreshTokenChainSweeps = 0
+	}
+	refreshTokenChainMu.Unlock()
+}
+
+func nextRefreshToken(token string, now time.Time) string {
+	refreshTokenChainMu.Lock()
+	entry, ok := refreshTokenChain[token]
+	if ok && !entry.expiry.IsZero() && !now.Before(entry.expiry) {
+		delete(refreshTokenChain, token)
+		refreshTokenChainMu.Unlock()
+		return ""
+	}
+	refreshTokenChainMu.Unlock()
+	if !ok {
+		return ""
+	}
+	return entry.next
+}
+
+func deleteRefreshTokenSuccessor(token string) {
+	refreshTokenChainMu.Lock()
+	delete(refreshTokenChain, token)
+	refreshTokenChainMu.Unlock()
+}
+
+func sweepExpiredRefreshTokenSuccessorsLocked(now time.Time) {
+	for token, entry := range refreshTokenChain {
+		if !entry.expiry.IsZero() && !now.Before(entry.expiry) {
+			delete(refreshTokenChain, token)
+		}
+	}
+}
+
+func parseRefreshTokenStateMap(data map[string]any) (core.RefreshTokenState, bool) {
+	rawUserData, hasUserData := data["user_data"]
+	if !hasUserData {
+		return core.RefreshTokenState{}, false
+	}
+	state := core.RefreshTokenState{UserData: rawUserData}
+	rawMaxRefresh, hasMaxRefresh := data["max_refresh_until"]
+	if !hasMaxRefresh || rawMaxRefresh == nil {
+		return state, true
+	}
+	switch v := rawMaxRefresh.(type) {
+	case time.Time:
+		state.MaxRefreshUntil = v
+		return state, true
+	case string:
+		parsed, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			parsed, err = time.Parse(time.RFC3339, v)
+			if err != nil {
+				return core.RefreshTokenState{}, false
+			}
+		}
+		state.MaxRefreshUntil = parsed
+		return state, true
+	default:
+		return core.RefreshTokenState{}, false
+	}
+}
+
+func parseRefreshTokenStateJSON(data any) (core.RefreshTokenState, bool) {
+	switch v := data.(type) {
+	case []byte:
+		var state core.RefreshTokenState
+		if err := json.Unmarshal(v, &state); err != nil {
+			return core.RefreshTokenState{}, false
+		}
+		return state, true
+	case string:
+		var state core.RefreshTokenState
+		if err := json.Unmarshal([]byte(v), &state); err != nil {
+			return core.RefreshTokenState{}, false
+		}
+		return state, true
+	default:
+		return core.RefreshTokenState{}, false
 	}
 }
 
