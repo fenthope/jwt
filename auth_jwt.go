@@ -243,11 +243,6 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 	if mw.Realm == "" {
 		return ErrMissingRealm
 	}
-	if mw.SigningAlgorithm != SigningAlgorithmMLDSA65 {
-		if _, ok := LookupAlgorithm(mw.SigningAlgorithm); !ok {
-			return ErrInvalidSigningAlgorithm
-		}
-	}
 	alg, ok := LookupAlgorithm(mw.SigningAlgorithm)
 	if !ok {
 		return ErrInvalidSigningAlgorithm

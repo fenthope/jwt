@@ -222,6 +222,7 @@ SecureCookie: true, // 启用后仅 HTTPS 传输
 - `SendCookie: false` 时，不会写 access token cookie，也不会写 refresh token cookie
 - `SendCookie: true` 时，`setAccessTokenCookie` 会写入 `CookieName` 指定的 access token cookie，但是否 `Secure` / `HttpOnly` 取决于 middleware 的 `SecureCookie` 和 `CookieHTTPOnly` 配置（需手动设置为 `true`）；同理，直接调用的 `SetCookie` 方法传入的 secure/httpOnly 参数来自 middleware 配置字段，而非由调用方随意指定
 - `SendCookie: true` 时，初始化阶段会把 `RefreshTokenSecureCookie` 和 `RefreshTokenCookieHTTPOnly` 自动设为 `true`，然后 `SetRefreshTokenCookie` 再写入 refresh token cookie
+- `SendCookie: false` 时，中间件不会自动把 `RefreshTokenSecureCookie` / `RefreshTokenCookieHTTPOnly` 改成安全默认值；如果你要自行写 refresh token cookie，需要自己显式把这两个字段设为 `true`
 - logout 清 cookie 也受 `SendCookie` 控制；如果没有启用 `SendCookie`，logout 不会额外尝试删除浏览器中的 cookie
 
 另外，access token cookie 的 `Max-Age` 以 access token 剩余有效期为准；refresh token cookie 的 `Max-Age` 以 `RefreshExpiresAt` 或 `RefreshTokenTimeout` 为准，二者并不共享同一过期策略。
