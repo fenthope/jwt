@@ -5,6 +5,7 @@ import (
 )
 
 type RefreshTokenStorer = core.TokenStore
+type RefreshTokenManager = core.RefreshTokenManager
 type RefreshTokenData = core.RefreshTokenData
 
 var (

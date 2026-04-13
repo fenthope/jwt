@@ -32,6 +32,25 @@ type TokenStore interface {
 	Count(ctx context.Context) (int, error)
 }
 
+// RefreshTokenManager is the higher-level refresh-token lifecycle abstraction.
+//
+// Unlike TokenStore, it owns the full middleware-facing refresh flow:
+// initial persistence on login, lookup during refresh, atomic rotation, and
+// logout revocation for the presented token. Implementations may keep all logic
+// in a shared datastore and are free to manage successor chains or session
+// metadata without exposing those details to the middleware.
+//
+// ToukaJWTMiddleware uses this interface preferentially when configured. When
+// it is nil, the middleware adapts the legacy TokenStore/
+// RefreshTokenRotator/RefreshTokenRevoker interfaces to preserve existing
+// behavior.
+type RefreshTokenManager interface {
+	Store(ctx context.Context, token string, userData any, expiry time.Time) error
+	Lookup(ctx context.Context, token string) (any, error)
+	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+	Revoke(ctx context.Context, token string) error
+}
+
 // RefreshTokenRotator atomically swaps an old refresh token for a new one.
 // Stores that implement this can avoid inconsistent intermediate states during
 // refresh-token rotation.

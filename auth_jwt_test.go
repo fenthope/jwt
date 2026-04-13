@@ -914,6 +914,66 @@ type recordingRevokerStore struct {
 	revokeErr   error
 }
 
+type refreshManagerStoreCall struct {
+	token string
+	data  any
+
+	expiry time.Time
+}
+
+type refreshManagerRotateCall struct {
+	oldToken string
+	newToken string
+	data     any
+	expiry   time.Time
+}
+
+type recordingRefreshTokenManager struct {
+	tokens      map[string]any
+	storeCalls  []refreshManagerStoreCall
+	lookupCalls []string
+	rotateCalls []refreshManagerRotateCall
+	revokeCalls []string
+	revokeErr   error
+}
+
+func (m *recordingRefreshTokenManager) Store(ctx context.Context, token string, userData any, expiry time.Time) error {
+	m.storeCalls = append(m.storeCalls, refreshManagerStoreCall{token: token, data: userData, expiry: expiry})
+	if m.tokens == nil {
+		m.tokens = map[string]any{}
+	}
+	m.tokens[token] = userData
+	return nil
+}
+
+func (m *recordingRefreshTokenManager) Lookup(ctx context.Context, token string) (any, error) {
+	m.lookupCalls = append(m.lookupCalls, token)
+	data, ok := m.tokens[token]
+	if !ok {
+		return nil, core.ErrRefreshTokenNotFound
+	}
+	return data, nil
+}
+
+func (m *recordingRefreshTokenManager) Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error {
+	m.rotateCalls = append(m.rotateCalls, refreshManagerRotateCall{oldToken: oldToken, newToken: newToken, data: userData, expiry: expiry})
+	if _, ok := m.tokens[oldToken]; !ok {
+		return core.ErrRefreshTokenNotFound
+	}
+	delete(m.tokens, oldToken)
+	m.tokens[newToken] = userData
+	return nil
+}
+
+func (m *recordingRefreshTokenManager) Revoke(ctx context.Context, token string) error {
+	m.revokeCalls = append(m.revokeCalls, token)
+	if m.revokeErr != nil {
+		return m.revokeErr
+	}
+	delete(m.tokens, token)
+	return nil
+}
+
 func (r *recordingRevokerStore) Set(ctx context.Context, token string, userData any, expiry time.Time) error {
 	r.tokens[token] = userData
 	return nil
@@ -1054,6 +1114,104 @@ func TestLogoutHandlerKeepsIdempotentBehaviorForAtomicRevoke(t *testing.T) {
 	auth.LogoutHandler(c)
 
 	assert.Len(t, store.revokeCalls, 1)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestTokenGeneratorUsesCustomRefreshTokenManager(t *testing.T) {
+	h := newHS512Helper()
+	manager := &recordingRefreshTokenManager{tokens: map[string]any{}}
+	config := h.middleware()
+	config.RefreshTokenManager = manager
+
+	auth, err := New(config)
+	require.NoError(t, err)
+
+	tokenPair, err := auth.TokenGenerator(t.Context(), "admin")
+	require.NoError(t, err)
+	assert.Len(t, manager.storeCalls, 1)
+	assert.Equal(t, tokenPair.RefreshToken, manager.storeCalls[0].token)
+	_, exists := manager.tokens[tokenPair.RefreshToken]
+	assert.True(t, exists)
+	assert.Nil(t, auth.TokenStore)
+}
+
+func TestRefreshHandlerUsesCustomRefreshTokenManager(t *testing.T) {
+	h := newHS512Helper()
+	manager := &recordingRefreshTokenManager{tokens: map[string]any{"old-refresh": "admin"}}
+	legacyStore := &nonRotatorStore{tokens: map[string]any{"old-refresh": "legacy-admin"}}
+	config := h.middleware()
+	config.RefreshTokenManager = manager
+	config.TokenStore = legacyStore
+
+	auth, err := New(config)
+	require.NoError(t, err)
+
+	handler := toukaHandlerForAlgorithm(auth)
+	r := gofight.New()
+	r.POST("/refresh").SetForm(gofight.H{"refresh_token": "old-refresh"}).Run(handler, func(r gofight.HTTPResponse, rq gofight.HTTPRequest) {
+		assert.Equal(t, http.StatusOK, r.Code)
+		assert.NotEmpty(t, gjson.Get(r.Body.String(), "access_token").String())
+		assert.NotEmpty(t, gjson.Get(r.Body.String(), "refresh_token").String())
+	})
+
+	assert.Equal(t, []string{"old-refresh"}, manager.lookupCalls)
+	assert.Len(t, manager.rotateCalls, 1)
+	assert.Equal(t, "old-refresh", manager.rotateCalls[0].oldToken)
+	assert.NotEmpty(t, manager.rotateCalls[0].newToken)
+	_, oldExists := manager.tokens["old-refresh"]
+	assert.False(t, oldExists)
+	_, legacyStillPresent := legacyStore.tokens["old-refresh"]
+	assert.True(t, legacyStillPresent, "legacy token store should not be used when RefreshTokenManager is configured")
+}
+
+func TestLogoutHandlerUsesCustomRefreshTokenManager(t *testing.T) {
+	h := newHS512Helper()
+	manager := &recordingRefreshTokenManager{tokens: map[string]any{"old-refresh": "admin"}}
+	legacyStore := &recordingRevokerStore{tokens: map[string]any{"old-refresh": "legacy-admin"}}
+	config := h.middleware()
+	config.RefreshTokenManager = manager
+	config.TokenStore = legacyStore
+
+	auth, err := New(config)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.AddCookie(&http.Cookie{Name: auth.RefreshTokenCookieName, Value: "old-refresh"})
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Equal(t, []string{"old-refresh"}, manager.revokeCalls)
+	_, exists := manager.tokens["old-refresh"]
+	assert.False(t, exists)
+	assert.Empty(t, legacyStore.revokeCalls)
+	assert.Empty(t, legacyStore.deleteCalls)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestLogoutHandlerKeepsIdempotentBehaviorForCustomRefreshTokenManager(t *testing.T) {
+	h := newHS512Helper()
+	manager := &recordingRefreshTokenManager{
+		tokens:    map[string]any{"old-refresh": "admin"},
+		revokeErr: core.ErrRefreshTokenNotFound,
+	}
+	config := h.middleware()
+	config.RefreshTokenManager = manager
+
+	auth, err := New(config)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.AddCookie(&http.Cookie{Name: auth.RefreshTokenCookieName, Value: "old-refresh"})
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Equal(t, []string{"old-refresh"}, manager.revokeCalls)
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 

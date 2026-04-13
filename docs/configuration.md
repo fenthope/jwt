@@ -44,7 +44,8 @@
 | `PubKeyBytes` | `[]byte` | 无 | 否 | 算法验签公钥字节数组。与 `PubKeyFile` 二选一 |
 | `ParseOptions` | `[]jwt.ParserOption` | 无 | 否 | JWT 解析选项，透传给 `jwt.Parse` |
 | `SendAuthorization` | `bool` | `false` | 否 | 是否在成功解析请求中的 Access Token 后，于响应 Header 中回传 `Authorization: <TokenHeadName> <token>` |
-| `TokenStore` | `core.TokenStore` | 内存存储 (`InMemoryRefreshTokenStore`) | 否 | Refresh Token 存储接口实现。若要支持 `RefreshHandler`，store 必须实现 `core.RefreshTokenRotator` |
+| `RefreshTokenManager` | `core.RefreshTokenManager` | 无 | 否 | 高层 Refresh Token 生命周期管理接口。若设置，则登录持久化、refresh 轮换、logout 撤销都会优先使用它 |
+| `TokenStore` | `core.TokenStore` | 内存存储 (`InMemoryRefreshTokenStore`) | 否 | 兼容模式下的 Refresh Token 存储接口实现。仅当 `RefreshTokenManager` 为空时使用；若要支持 `RefreshHandler`，store 必须实现 `core.RefreshTokenRotator` |
 | `DisabledAbort` | `bool` | `false` | 否 | 认证失败后是否阻止后续 Handler 执行。默认会先调用 `c.Abort()` 再执行 `Unauthorized`；设为 `true` 时仅执行 `Unauthorized` |
 
 ## 密钥配置说明

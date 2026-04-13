@@ -145,7 +145,18 @@ refresh token 是长期 bearer secret，不应该放在 URL 里。
 
 推荐使用 `POST` + cookie 或 `POST` + form，不要把 refresh token 放到 query string。
 
-`RefreshHandler` 要求 `TokenStore` 实现原子 refresh rotation。为此，store 必须实现 `core.RefreshTokenRotator`：
+`RefreshHandler` 默认通过高层 `core.RefreshTokenManager` 管理 refresh token 生命周期。如果未配置该接口，则会回退到兼容模式，要求 `TokenStore` 实现原子 refresh rotation。高层接口如下：
+
+```go
+type RefreshTokenManager interface {
+	Store(ctx context.Context, token string, userData any, expiry time.Time) error
+	Lookup(ctx context.Context, token string) (any, error)
+	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+	Revoke(ctx context.Context, token string) error
+}
+```
+
+兼容模式下，store 仍需实现 `core.RefreshTokenRotator`：
 
 ```go
 type RefreshTokenRotator interface {
@@ -154,7 +165,7 @@ type RefreshTokenRotator interface {
 }
 ```
 
-如果 store 没有实现这个接口，`RefreshHandler` 会返回错误而不是回退到非原子 `Set(new) -> Delete(old)` 流程。默认内存 store 已实现该接口。
+如果既没有配置 `RefreshTokenManager`，store 也没有实现这个接口，`RefreshHandler` 会返回错误而不是回退到非原子 `Set(new) -> Delete(old)` 流程。默认内存 store 已实现兼容模式所需接口。
 
 refresh token 的生命周期还受两个时长共同影响：
 
@@ -167,9 +178,8 @@ refresh token 的生命周期还受两个时长共同影响：
 `LogoutHandler` 执行用户登出并撤销 refresh token：
 
 - 从 cookie 或 form 提取当前 refresh token
-- 按进程内记录且仍未过期的 successor 链查找相关 token
-- 若 store 实现 `RefreshTokenRevoker`，调用 `Revoke` 原子撤销整链
-- 否则逐个 `Delete`
+- 若配置了 `RefreshTokenManager`，调用其 `Revoke` 处理当前 token 的注销语义
+- 否则按进程内记录且仍未过期的 successor 链查找相关 token，并通过 `RefreshTokenRevoker` 或逐个 `Delete` 执行兼容模式撤销
 - 若 `SendCookie=true`，清除 access token 和 refresh token cookie
 
 ## Example App

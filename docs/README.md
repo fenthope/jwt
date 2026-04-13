@@ -18,10 +18,10 @@ Touka 框架的 JWT 中间件，移植自 [appleboy/gin-jwt](https://github.com/
 | 默认算法 | ML-DSA-65 |
 | Access Token 提取 | 支持 `header / query / cookie / param / form`，默认仅 `header:Authorization`，可通过逗号组合多个来源 |
 | Refresh Token | 仅从 cookie 或 form body 提取，避免暴露在 URL |
-| Refresh Token 存储 | 默认使用内存存储 `InMemoryRefreshTokenStore`；可替换为自定义 `TokenStore` |
+| Refresh Token 存储 | 默认使用内存存储 `InMemoryRefreshTokenStore`；可替换为自定义 `TokenStore`，或直接提供高层 `RefreshTokenManager` |
 | Refresh Token 状态 | 配置 `MaxRefresh` 时，store 中保存 `RefreshTokenState{user_data, max_refresh_until}`；未配置时直接保存用户数据 |
-| Token 轮换 | `RefreshHandler` 会生成新的 refresh token，并要求 store 实现 `RefreshTokenRotator` 做原子轮换；默认内存 store 已实现 |
-| Logout 行为 | `LogoutHandler` 会删除当前 refresh token；若该 token 已在本进程内被轮换，还会继续删除已记录且未过期的后继 token 链 |
+| Token 轮换 | `RefreshHandler` 优先使用 `RefreshTokenManager`；未配置时回退为要求 store 实现 `RefreshTokenRotator` 的兼容模式 |
+| Logout 行为 | `LogoutHandler` 优先使用 `RefreshTokenManager.Revoke`；未配置时会删除当前 refresh token，并继续删除本进程内已记录且未过期的后继 token 链 |
 
 ## 默认值
 
@@ -45,10 +45,10 @@ Touka 框架的 JWT 中间件，移植自 [appleboy/gin-jwt](https://github.com/
 
 ## Refresh Token 行为摘要
 
-- 登录时会同时生成 access token 和 refresh token，并将 refresh token 写入 `TokenStore`。
+- 登录时会同时生成 access token 和 refresh token，并将 refresh token 写入 `RefreshTokenManager`；若未配置则回退写入 `TokenStore`。
 - `RefreshHandler` 只接受两种 refresh token 来源：`RefreshTokenCookieName` 对应的 cookie 或同名 form 字段（默认名为 `refresh_token`）。
 - 刷新时会保留原有 refresh token 的绝对过期上限：新的 token 过期时间取 `now + RefreshTokenTimeout` 与 `max_refresh_until` 中较早者。
-- 如果 `TokenStore` 没有实现 `RefreshTokenRotator`，刷新会直接失败并返回错误，而不是退化为非原子删除加写入。
+- 如果既没有配置 `RefreshTokenManager`，`TokenStore` 也没有实现 `RefreshTokenRotator`，刷新会直接失败并返回错误，而不是退化为非原子删除加写入。
 - 默认内存 store 会在 `Get` 时按需删除当前已过期 token，在 `Cleanup` 时批量清理过期 token；`Rotate` 只针对参与轮换的旧 token 做过期检查，并保证单个 token 的轮换是原子的。
 
 ## 快速开始
