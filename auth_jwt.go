@@ -25,6 +25,10 @@ type tokenLookupSource struct {
 	name string
 }
 
+type tokenStoreRefreshTokenManager struct {
+	mw *ToukaJWTMiddleware
+}
+
 type refreshTokenLockEntry struct {
 	mu   sync.Mutex
 	refs int
@@ -90,6 +94,11 @@ type ToukaJWTMiddleware struct {
 	// PubKeyBytes contains the algorithm-specific verification-key input bytes.
 	PubKeyBytes []byte
 
+	// RefreshTokenManager owns the higher-level refresh lifecycle. When set, it
+	// is used for login persistence, refresh rotation, and logout revocation.
+	RefreshTokenManager core.RefreshTokenManager
+	// TokenStore remains the low-level compatibility path used when
+	// RefreshTokenManager is nil.
 	TokenStore core.TokenStore
 
 	algorithm     Algorithm
@@ -229,7 +238,7 @@ func (mw *ToukaJWTMiddleware) MiddlewareInit() error {
 		}
 	}
 
-	if mw.TokenStore == nil {
+	if mw.TokenStore == nil && mw.RefreshTokenManager == nil {
 		mw.inMemoryStore = store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)
 		mw.TokenStore = mw.inMemoryStore
 	}
@@ -412,13 +421,10 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
 	refreshToken := mw.extractRefreshToken(c)
 	if refreshToken != "" {
-		tokens, unlock := lockRefreshTokenChain(refreshToken, mw.TimeFunc())
-		defer unlock()
-		if err := mw.revokeRefreshTokenChain(c.Request.Context(), tokens); err != nil {
+		if err := mw.revokeRefreshToken(c.Request.Context(), refreshToken); err != nil {
 			mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 			return
 		}
-		deleteRefreshTokenSuccessors(tokens)
 	}
 	if mw.SendCookie {
 		mw.writeCookie(c, mw.CookieName, "", -1, mw.SecureCookie, mw.CookieHTTPOnly)
@@ -433,7 +439,7 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingRefreshToken, c))
 		return
 	}
-	userData, err := mw.TokenStore.Get(c.Request.Context(), refreshToken)
+	userData, err := mw.refreshTokenManager().Lookup(c.Request.Context(), refreshToken)
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
@@ -471,7 +477,7 @@ func (mw *ToukaJWTMiddleware) TokenGenerator(ctx context.Context, data any) (*co
 	}
 	storedToken := mw.newRefreshTokenState(data)
 	tokenPair.RefreshExpiresAt = mw.refreshTokenExpiry(storedToken).Unix()
-	err = mw.TokenStore.Set(ctx, tokenPair.RefreshToken, storedToken, time.Unix(tokenPair.RefreshExpiresAt, 0))
+	err = mw.refreshTokenManager().Store(ctx, tokenPair.RefreshToken, storedToken, time.Unix(tokenPair.RefreshExpiresAt, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -513,28 +519,15 @@ func (mw *ToukaJWTMiddleware) generateTokenPair(data any) (*core.Token, error) {
 }
 
 func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
-	unlock := acquireRefreshTokenLock(oldToken)
-	defer unlock()
-	currentToken, err := mw.TokenStore.Get(ctx, oldToken)
-	if err != nil {
-		return err
-	}
-	currentToken = mw.normalizeRefreshTokenState(currentToken)
-	if currentToken == nil {
-		return core.ErrRefreshTokenNotFound
-	}
-	if err := mw.validateRefreshTokenState(currentToken); err != nil {
-		return err
-	}
-	expiry := mw.refreshTokenExpiry(currentToken)
-	if rotator, ok := mw.TokenStore.(core.RefreshTokenRotator); ok {
-		if err := rotator.Rotate(ctx, oldToken, newToken, currentToken, expiry); err != nil {
-			return err
-		}
-		setRefreshTokenSuccessor(oldToken, newToken, expiry, mw.TimeFunc())
+	return mw.refreshTokenManager().Rotate(ctx, oldToken, newToken, userData, mw.refreshTokenExpiry(userData))
+}
+
+func (mw *ToukaJWTMiddleware) revokeRefreshToken(ctx context.Context, token string) error {
+	err := mw.refreshTokenManager().Revoke(ctx, token)
+	if err == nil || errors.Is(err, core.ErrRefreshTokenNotFound) || errors.Is(err, core.ErrRefreshTokenExpired) {
 		return nil
 	}
-	return ErrUnsafeRefreshRotation
+	return err
 }
 
 func (mw *ToukaJWTMiddleware) revokeRefreshTokenChain(ctx context.Context, tokens []string) error {
@@ -676,6 +669,68 @@ func (mw *ToukaJWTMiddleware) extractRefreshToken(c *touka.Context) string {
 		return token
 	}
 	return ""
+}
+
+func (mw *ToukaJWTMiddleware) refreshTokenManager() core.RefreshTokenManager {
+	if mw.RefreshTokenManager != nil {
+		return mw.RefreshTokenManager
+	}
+	return tokenStoreRefreshTokenManager{mw: mw}
+}
+
+func (m tokenStoreRefreshTokenManager) Store(ctx context.Context, token string, userData any, expiry time.Time) error {
+	if m.mw.TokenStore == nil {
+		return errors.New("token store is missing")
+	}
+	return m.mw.TokenStore.Set(ctx, token, userData, expiry)
+}
+
+func (m tokenStoreRefreshTokenManager) Lookup(ctx context.Context, token string) (any, error) {
+	if m.mw.TokenStore == nil {
+		return nil, errors.New("token store is missing")
+	}
+	return m.mw.TokenStore.Get(ctx, token)
+}
+
+func (m tokenStoreRefreshTokenManager) Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error {
+	if m.mw.TokenStore == nil {
+		return errors.New("token store is missing")
+	}
+	unlock := acquireRefreshTokenLock(oldToken)
+	defer unlock()
+	currentToken, err := m.mw.TokenStore.Get(ctx, oldToken)
+	if err != nil {
+		return err
+	}
+	currentToken = m.mw.normalizeRefreshTokenState(currentToken)
+	if currentToken == nil {
+		return core.ErrRefreshTokenNotFound
+	}
+	if err := m.mw.validateRefreshTokenState(currentToken); err != nil {
+		return err
+	}
+	expiry = m.mw.refreshTokenExpiry(currentToken)
+	if rotator, ok := m.mw.TokenStore.(core.RefreshTokenRotator); ok {
+		if err := rotator.Rotate(ctx, oldToken, newToken, currentToken, expiry); err != nil {
+			return err
+		}
+		setRefreshTokenSuccessor(oldToken, newToken, expiry, m.mw.TimeFunc())
+		return nil
+	}
+	return ErrUnsafeRefreshRotation
+}
+
+func (m tokenStoreRefreshTokenManager) Revoke(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	tokens, unlock := lockRefreshTokenChain(token, m.mw.TimeFunc())
+	defer unlock()
+	if err := m.mw.revokeRefreshTokenChain(ctx, tokens); err != nil {
+		return err
+	}
+	deleteRefreshTokenSuccessors(tokens)
+	return nil
 }
 
 func (mw *ToukaJWTMiddleware) signedString(token *jwt.Token) (string, error) {

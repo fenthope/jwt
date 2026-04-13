@@ -100,9 +100,16 @@ func (t *Token) ExpiresIn() int64 {
 > {"code": 200, "access_token": "...", "refresh_token": "...", "expire": "2024-01-01T12:00:00Z"}
 > ```
 
-### TokenStore / RefreshTokenRotator
+### RefreshTokenManager / TokenStore / RefreshTokenRotator
 
 ```go
+type RefreshTokenManager interface {
+    Store(ctx context.Context, token string, userData any, expiry time.Time) error
+    Lookup(ctx context.Context, token string) (any, error)
+    Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+    Revoke(ctx context.Context, token string) error
+}
+
 type TokenStore interface {
     Set(ctx context.Context, token string, userData any, expiry time.Time) error
     Get(ctx context.Context, token string) (any, error)
@@ -122,11 +129,15 @@ type RefreshTokenRevoker interface {
 }
 ```
 
-实现此接口的 store 可以让 LogoutHandler 原子性地撤销整条 refresh token 链。
+`RefreshTokenManager` 是高层 refresh 生命周期抽象。实现它后，可以自行管理 refresh token 的持久化、查找、原子轮换和注销逻辑；middleware 不再要求你复用进程内 successor 链或 `TokenStore` 的低层组合语义。
 
-`TokenStore` 用于持久化 refresh token 及其关联的 `userData`。默认实现是内存 store：`store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)`。
+实现 `RefreshTokenRevoker` 的 store 可以让兼容模式下的 `LogoutHandler` 原子性地撤销整条 refresh token 链。
 
-`RefreshTokenRotator` 用于原子地将旧 refresh token 轮换为新 token。`RefreshHandler` 在执行 refresh token rotation 时要求 `TokenStore` 实现该接口，否则返回 `ErrUnsafeRefreshRotation`。
+`RefreshTokenManager` 优先级高于 `TokenStore`。默认情况下未显式配置 manager 时，middleware 会创建内存 store：`store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)`，并通过兼容适配层把它当作 refresh manager 使用。
+
+`TokenStore` 用于兼容模式下持久化 refresh token 及其关联的 `userData`。
+
+`RefreshTokenRotator` 用于兼容模式下原子地将旧 refresh token 轮换为新 token。`RefreshHandler` 在未配置 `RefreshTokenManager` 时要求 `TokenStore` 实现该接口，否则返回 `ErrUnsafeRefreshRotation`。
 
 当配置了 `MaxRefresh` 时，store 中保存的数据不是裸 `userData`，而是：
 
@@ -266,13 +277,14 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context)
 
 1. 按顺序从 cookie 或 form body（key 为 `RefreshTokenCookieName`，默认 `refresh_token`）提取 refresh token（`extractRefreshToken`）
 2. 若未找到 refresh token，返回 400
-3. 调用 `TokenStore.Get` 验证 refresh token 并获取关联的用户数据
+3. 调用 `RefreshTokenManager.Lookup` 验证 refresh token 并获取关联的用户数据；若未配置 manager，则回退调用 `TokenStore.Get`
 4. 若验证失败，返回 401
 5. 标准化并验证 refresh token 状态；若配置了 `MaxRefresh`，会校验 `MaxRefreshUntil`
 6. 调用 `generateTokenPair` 生成新 token pair
 7. 调用 `rotateRefreshToken` 执行 refresh token rotation：
-   - store 必须实现 `RefreshTokenRotator` 接口，并调用原子 `Rotate`
-   - 若未实现，则返回 `ErrUnsafeRefreshRotation`，HTTP 500
+   - 若配置了 `RefreshTokenManager`，调用其 `Rotate`
+   - 否则要求 store 实现 `RefreshTokenRotator` 接口，并调用兼容模式的原子 `Rotate`
+   - 若兼容模式下未实现，则返回 `ErrUnsafeRefreshRotation`，HTTP 500
    - 若 `rotateRefreshToken` 返回 `ErrRefreshTokenNotFound` 或 `ErrRefreshTokenExpired`，按 401 处理
 8. 新 token 的 `RefreshExpiresAt` 继承自旧 refresh token 状态的有效期上限，不会因为 refresh 而无限延长
 8. 若 `SendCookie` 为 `true`，设置新的 access token 和 refresh token cookie
@@ -312,7 +324,7 @@ body: "refresh_token=xxx"
 | `ErrMissingRefreshToken` | 400 | 未提供 refresh token |
 | `core.ErrRefreshTokenNotFound` | 401 | refresh token 不存在或已撤销 |
 | `core.ErrRefreshTokenExpired` | 401 | refresh token 已过期，或超过 `MaxRefresh` 限制 |
-| `ErrUnsafeRefreshRotation` | 500 | `TokenStore` 未实现 `RefreshTokenRotator` |
+| `ErrUnsafeRefreshRotation` | 500 | 未配置 `RefreshTokenManager` 且 `TokenStore` 未实现 `RefreshTokenRotator` |
 
 ---
 
@@ -344,9 +356,10 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 ### 内部流程
 
 1. 按顺序从 cookie 或 form body 提取 refresh token
-2. 若找到 refresh token，按当前进程内记录且仍未过期的 successor 链获取可撤销链。若 store 实现 RefreshTokenRevoker 接口，调用 Revoke 原子撤销整链；否则逐个 Delete
-3. 删除过程中会忽略 `core.ErrRefreshTokenNotFound` 和 `core.ErrRefreshTokenExpired`
-4. 若删除出现其他错误，返回 500
+2. 若找到 refresh token，优先调用 `RefreshTokenManager.Revoke`
+3. 未配置 manager 时，按当前进程内记录且仍未过期的 successor 链获取可撤销链。若 store 实现 `RefreshTokenRevoker` 接口，调用 `Revoke` 原子撤销整链；否则逐个 `Delete`
+4. 删除过程中会忽略 `core.ErrRefreshTokenNotFound` 和 `core.ErrRefreshTokenExpired`
+5. 若删除出现其他错误，返回 500
 5. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
 6. 调用 `LogoutResponse` 返回响应
 
@@ -356,7 +369,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 engine.POST("/logout", auth.LogoutHandler)
 ```
 
-注意：`LogoutHandler` 会基于当前进程内记录的 refresh token successor 链删除相关 token，同时清除客户端 cookie。logout 只会沿仍未过期的 successor 映射继续追链；过期映射会被视为链路中断。该链不是持久化状态，也不是跨实例共享状态；如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
+注意：若配置了 `RefreshTokenManager`，`LogoutHandler` 的撤销语义完全由该接口决定。未配置时，才会基于当前进程内记录的 refresh token successor 链删除相关 token，同时清除客户端 cookie。兼容模式下该链只沿仍未过期的 successor 映射继续追链；过期映射会被视为链路中断。该链不是持久化状态，也不是跨实例共享状态；如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
 
 ---
 
