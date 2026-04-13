@@ -884,7 +884,9 @@ func lockRefreshTokenChain(token string, now time.Time) ([]string, func()) {
 		seen[token] = struct{}{}
 		unlockers = append(unlockers, acquireRefreshTokenLock(token))
 		tokens = append(tokens, token)
-		token = logoutSuccessorToken(token)
+		// Expired successor edges terminate logout traversal so a stale ancestor
+		// token cannot keep revoking newer sessions after its own expiry window.
+		token = nextRefreshToken(token, now)
 	}
 	return tokens, func() {
 		for i := len(unlockers) - 1; i >= 0; i-- {
@@ -917,22 +919,6 @@ func nextRefreshToken(token string, now time.Time) string {
 		return ""
 	}
 	return entry.next
-}
-
-func logoutSuccessorToken(token string) string {
-	refreshTokenChainMu.Lock()
-	entry, ok := refreshTokenChain[token]
-	refreshTokenChainMu.Unlock()
-	if !ok {
-		return ""
-	}
-	return entry.next
-}
-
-func deleteRefreshTokenSuccessor(token string) {
-	refreshTokenChainMu.Lock()
-	delete(refreshTokenChain, token)
-	refreshTokenChainMu.Unlock()
 }
 
 func deleteRefreshTokenSuccessors(tokens []string) {

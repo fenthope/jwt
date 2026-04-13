@@ -991,7 +991,7 @@ func TestLogoutHandlerUsesAtomicRevokeWhenAvailable(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-func TestLogoutHandlerRevokesKnownSuccessorsPastExpiredLink(t *testing.T) {
+func TestLogoutHandlerStopsAtExpiredSuccessorLink(t *testing.T) {
 	auth, err := New(&ToukaJWTMiddleware{
 		Realm: "test",
 		Key:   testPrivateKey(t),
@@ -1019,12 +1019,15 @@ func TestLogoutHandlerRevokesKnownSuccessorsPastExpiredLink(t *testing.T) {
 	auth.LogoutHandler(c)
 
 	assert.Len(t, store.revokeCalls, 1)
-	assert.Equal(t, []string{"r1", "r2", "r3"}, store.revokeCalls[0].tokens)
-	for _, token := range []string{"r1", "r2", "r3"} {
-		_, err := store.Get(context.Background(), token)
-		assert.ErrorIs(t, err, core.ErrRefreshTokenNotFound)
-		assert.Equal(t, "", logoutSuccessorToken(token))
-	}
+	assert.Equal(t, []string{"r1"}, store.revokeCalls[0].tokens)
+	_, err = store.Get(context.Background(), "r1")
+	assert.ErrorIs(t, err, core.ErrRefreshTokenNotFound)
+	_, err = store.Get(context.Background(), "r2")
+	assert.NoError(t, err)
+	_, err = store.Get(context.Background(), "r3")
+	assert.NoError(t, err)
+	assert.Equal(t, "", nextRefreshToken("r1", now))
+	assert.Equal(t, "r3", nextRefreshToken("r2", now))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 

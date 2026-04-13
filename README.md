@@ -22,6 +22,7 @@ Touka 的 JWT 中间件。
 - `ExpField`：`exp`
 - `CookieName`：`jwt`
 - `RefreshTokenCookieName`：`refresh_token`
+- 完整的 cookie 配置项请参考 [configuration.md](./docs/configuration.md)
 
 ## Breaking Changes
 
@@ -160,6 +161,16 @@ refresh token 的生命周期还受两个时长共同影响：
 - 每次生成或轮换时，底层 store 中保存的 refresh token 过期时间为 `min(now + RefreshTokenTimeout, MaxRefreshUntil)`
 - 如果设置了 `MaxRefresh`，首次登录时会把绝对上限写入 `RefreshTokenState.MaxRefreshUntil`
 - `RefreshHandler` 返回的新 refresh token 会继承原来的绝对上限，不会因为轮换而无限续期
+
+## Logout Handler
+
+`LogoutHandler` 执行用户登出并撤销 refresh token：
+
+- 从 cookie 或 form 提取当前 refresh token
+- 按进程内记录且仍未过期的 successor 链查找相关 token
+- 若 store 实现 `RefreshTokenRevoker`，调用 `Revoke` 原子撤销整链
+- 否则逐个 `Delete`
+- 若 `SendCookie=true`，清除 access token 和 refresh token cookie
 
 ## Example App
 
