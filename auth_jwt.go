@@ -519,7 +519,6 @@ func (mw *ToukaJWTMiddleware) generateTokenPair(data any) (*core.Token, error) {
 }
 
 func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, newToken string, userData any) error {
-	userData = mw.normalizeRefreshTokenState(userData)
 	return mw.refreshTokenManager().Rotate(ctx, oldToken, newToken, userData, mw.refreshTokenExpiry(userData))
 }
 
