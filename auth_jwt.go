@@ -417,27 +417,13 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context) {
 func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
 	refreshToken := mw.extractRefreshToken(c)
 	if refreshToken != "" {
-		token := refreshToken
-		unlock := acquireRefreshTokenLock(token)
-		for token != "" {
-			next := nextRefreshToken(token, mw.TimeFunc())
-			var nextUnlock func()
-			if next != "" {
-				nextUnlock = acquireRefreshTokenLock(next)
-			}
-			if err := mw.TokenStore.Delete(c.Request.Context(), token); err != nil && !errors.Is(err, core.ErrRefreshTokenNotFound) && !errors.Is(err, core.ErrRefreshTokenExpired) {
-				if nextUnlock != nil {
-					nextUnlock()
-				}
-				unlock()
-				mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
-				return
-			}
-			deleteRefreshTokenSuccessor(token)
-			unlock()
-			unlock = nextUnlock
-			token = next
+		tokens, unlock := lockRefreshTokenChain(refreshToken, mw.TimeFunc())
+		defer unlock()
+		if err := mw.revokeRefreshTokenChain(c.Request.Context(), tokens); err != nil {
+			mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
+			return
 		}
+		deleteRefreshTokenSuccessors(tokens)
 	}
 	if mw.SendCookie {
 		mw.writeCookie(c, mw.CookieName, "", -1, mw.SecureCookie, mw.CookieHTTPOnly)
@@ -476,8 +462,10 @@ func (mw *ToukaJWTMiddleware) RefreshHandler(c *touka.Context) {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 		return
 	}
-	mw.setAccessTokenCookie(c, tokenPair.AccessToken, tokenPair.ExpiresAt)
-	mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken, tokenPair.RefreshExpiresAt)
+	if mw.SendCookie {
+		mw.setAccessTokenCookie(c, tokenPair.AccessToken, tokenPair.ExpiresAt)
+		mw.SetRefreshTokenCookie(c, tokenPair.RefreshToken, tokenPair.RefreshExpiresAt)
+	}
 	mw.RefreshResponse(c, http.StatusOK, tokenPair)
 }
 
@@ -552,6 +540,25 @@ func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, 
 		return nil
 	}
 	return ErrUnsafeRefreshRotation
+}
+
+func (mw *ToukaJWTMiddleware) revokeRefreshTokenChain(ctx context.Context, tokens []string) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+	if revoker, ok := mw.TokenStore.(core.RefreshTokenRevoker); ok {
+		err := revoker.Revoke(ctx, tokens)
+		if err == nil || errors.Is(err, core.ErrRefreshTokenNotFound) || errors.Is(err, core.ErrRefreshTokenExpired) {
+			return nil
+		}
+		return err
+	}
+	for _, token := range tokens {
+		if err := mw.TokenStore.Delete(ctx, token); err != nil && !errors.Is(err, core.ErrRefreshTokenNotFound) && !errors.Is(err, core.ErrRefreshTokenExpired) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (mw *ToukaJWTMiddleware) generateRefreshToken() (string, error) {
@@ -863,6 +870,31 @@ func acquireRefreshTokenLock(token string) func() {
 	}
 }
 
+func lockRefreshTokenChain(token string, now time.Time) ([]string, func()) {
+	if token == "" {
+		return nil, func() {}
+	}
+	seen := map[string]struct{}{}
+	tokens := []string{}
+	unlockers := []func(){}
+	for token != "" {
+		if _, ok := seen[token]; ok {
+			break
+		}
+		seen[token] = struct{}{}
+		unlockers = append(unlockers, acquireRefreshTokenLock(token))
+		tokens = append(tokens, token)
+		// Expired successor edges terminate logout traversal so a stale ancestor
+		// token cannot keep revoking newer sessions after its own expiry window.
+		token = nextRefreshToken(token, now)
+	}
+	return tokens, func() {
+		for i := len(unlockers) - 1; i >= 0; i-- {
+			unlockers[i]()
+		}
+	}
+}
+
 func setRefreshTokenSuccessor(oldToken, newToken string, expiry, now time.Time) {
 	refreshTokenChainMu.Lock()
 	refreshTokenChain[oldToken] = refreshTokenChainEntry{next: newToken, expiry: expiry}
@@ -889,9 +921,14 @@ func nextRefreshToken(token string, now time.Time) string {
 	return entry.next
 }
 
-func deleteRefreshTokenSuccessor(token string) {
+func deleteRefreshTokenSuccessors(tokens []string) {
+	if len(tokens) == 0 {
+		return
+	}
 	refreshTokenChainMu.Lock()
-	delete(refreshTokenChain, token)
+	for _, token := range tokens {
+		delete(refreshTokenChain, token)
+	}
 	refreshTokenChainMu.Unlock()
 }
 

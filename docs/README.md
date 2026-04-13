@@ -21,7 +21,7 @@ Touka 框架的 JWT 中间件，移植自 [appleboy/gin-jwt](https://github.com/
 | Refresh Token 存储 | 默认使用内存存储 `InMemoryRefreshTokenStore`；可替换为自定义 `TokenStore` |
 | Refresh Token 状态 | 配置 `MaxRefresh` 时，store 中保存 `RefreshTokenState{user_data, max_refresh_until}`；未配置时直接保存用户数据 |
 | Token 轮换 | `RefreshHandler` 会生成新的 refresh token，并要求 store 实现 `RefreshTokenRotator` 做原子轮换；默认内存 store 已实现 |
-| Logout 行为 | `LogoutHandler` 会删除当前 refresh token；若该 token 已在本进程内被轮换，还会继续删除已记录的后继 token 链 |
+| Logout 行为 | `LogoutHandler` 会删除当前 refresh token；若该 token 已在本进程内被轮换，还会继续删除已记录且未过期的后继 token 链 |
 
 ## 默认值
 
@@ -54,22 +54,29 @@ Touka 框架的 JWT 中间件，移植自 [appleboy/gin-jwt](https://github.com/
 ## 快速开始
 
 ```go
-seed := make([]byte, mldsa.MLDSA65().SeedSize())
-if _, err := io.ReadFull(rand.Reader, seed); err != nil {
-    panic(err)
+import (
+	"filippo.io/mldsa"
+	jwtmw "github.com/fenthope/jwt"
+	"github.com/infinite-iroha/touka"
+	"time"
+)
+
+privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
+if err != nil {
+	panic(err)
 }
 
 mw := &jwtmw.ToukaJWTMiddleware{
-    Realm: "test zone",
-    PrivKeyBytes: seed,
-    Timeout: time.Hour,
-    MaxRefresh: 7 * 24 * time.Hour,
-    Authenticator: func(c *touka.Context) (any, error) {
-        return "admin", nil
-    },
-    PayloadFunc: func(data any) jwtmw.MapClaims {
-        return jwtmw.MapClaims{"identity": data}
-    },
+	Realm: "test zone",
+	Key: privateKey,
+	Timeout: time.Hour,
+	MaxRefresh: 7 * 24 * time.Hour,
+	Authenticator: func(c *touka.Context) (any, error) {
+		return "admin", nil
+	},
+	PayloadFunc: func(data any) jwtmw.MapClaims {
+		return jwtmw.MapClaims{"identity": data}
+	},
 }
 ```
 

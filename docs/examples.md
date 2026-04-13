@@ -172,7 +172,7 @@ curl http://localhost:8000/auth/hello \
 
 ## 2. Verify-Only Mode
 
-如果服务只负责验证 token、不负责签发，可以使用 Verify-Only 模式。此时只提供公钥，不配置私钥，因此不能调用 `LoginHandler` 和 `RefreshHandler`。
+如果服务只负责验证 token、不负责签发，可以使用 Verify-Only 模式。此时只提供公钥（通过 PubKeyBytes 或 PubKeyFile），不配置私钥（Key 为 nil），因此不能调用 `LoginHandler` 和 `RefreshHandler`。
 
 ```go
 package main
@@ -188,7 +188,7 @@ import (
 )
 
 func main() {
-    // 这里假设公钥已经持久化并从配置或文件中读出。
+    // 这里假设公钥已经从配置或文件中加载，并设置到 PubKeyBytes
     privateKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
     if err != nil {
         log.Fatal(err)

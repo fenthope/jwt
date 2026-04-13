@@ -903,6 +903,160 @@ func (r *recordingRotatorStore) Count(ctx context.Context) (int, error) {
 	return len(r.tokens), nil
 }
 
+type revokeCall struct {
+	tokens []string
+}
+
+type recordingRevokerStore struct {
+	tokens      map[string]any
+	revokeCalls []revokeCall
+	deleteCalls []string
+	revokeErr   error
+}
+
+func (r *recordingRevokerStore) Set(ctx context.Context, token string, userData any, expiry time.Time) error {
+	r.tokens[token] = userData
+	return nil
+}
+
+func (r *recordingRevokerStore) Get(ctx context.Context, token string) (any, error) {
+	data, ok := r.tokens[token]
+	if !ok {
+		return nil, core.ErrRefreshTokenNotFound
+	}
+	return data, nil
+}
+
+func (r *recordingRevokerStore) Delete(ctx context.Context, token string) error {
+	r.deleteCalls = append(r.deleteCalls, token)
+	delete(r.tokens, token)
+	return nil
+}
+
+func (r *recordingRevokerStore) Revoke(ctx context.Context, tokens []string) error {
+	cloned := append([]string(nil), tokens...)
+	r.revokeCalls = append(r.revokeCalls, revokeCall{tokens: cloned})
+	if r.revokeErr != nil {
+		return r.revokeErr
+	}
+	for _, token := range tokens {
+		delete(r.tokens, token)
+	}
+	return nil
+}
+
+func (r *recordingRevokerStore) Cleanup(ctx context.Context) (int, error) {
+	return 0, nil
+}
+
+func (r *recordingRevokerStore) Count(ctx context.Context) (int, error) {
+	return len(r.tokens), nil
+}
+
+func TestLogoutHandlerUsesAtomicRevokeWhenAvailable(t *testing.T) {
+	auth, err := New(&ToukaJWTMiddleware{
+		Realm: "test",
+		Key:   testPrivateKey(t),
+	})
+	require.NoError(t, err)
+
+	store := &recordingRevokerStore{tokens: map[string]any{
+		"r1": "admin",
+		"r2": "admin",
+		"r3": "admin",
+	}}
+	auth.TokenStore = store
+
+	now := time.Now()
+	setRefreshTokenSuccessor("r1", "r2", now.Add(time.Minute), now)
+	setRefreshTokenSuccessor("r2", "r3", now.Add(time.Minute), now)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	form := strings.NewReader("refresh_token=r1")
+	req := httptest.NewRequest(http.MethodPost, "/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Len(t, store.revokeCalls, 1)
+	assert.Equal(t, []string{"r1", "r2", "r3"}, store.revokeCalls[0].tokens)
+	assert.Empty(t, store.deleteCalls)
+	for _, token := range []string{"r1", "r2", "r3"} {
+		_, err := store.Get(context.Background(), token)
+		assert.ErrorIs(t, err, core.ErrRefreshTokenNotFound)
+		assert.Equal(t, "", nextRefreshToken(token, time.Now()))
+	}
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestLogoutHandlerStopsAtExpiredSuccessorLink(t *testing.T) {
+	auth, err := New(&ToukaJWTMiddleware{
+		Realm: "test",
+		Key:   testPrivateKey(t),
+	})
+	require.NoError(t, err)
+
+	store := &recordingRevokerStore{tokens: map[string]any{
+		"r1": "admin",
+		"r2": "admin",
+		"r3": "admin",
+	}}
+	auth.TokenStore = store
+
+	now := time.Now()
+	setRefreshTokenSuccessor("r1", "r2", now.Add(-time.Second), now)
+	setRefreshTokenSuccessor("r2", "r3", now.Add(time.Minute), now)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	form := strings.NewReader("refresh_token=r1")
+	req := httptest.NewRequest(http.MethodPost, "/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Len(t, store.revokeCalls, 1)
+	assert.Equal(t, []string{"r1"}, store.revokeCalls[0].tokens)
+	_, err = store.Get(context.Background(), "r1")
+	assert.ErrorIs(t, err, core.ErrRefreshTokenNotFound)
+	_, err = store.Get(context.Background(), "r2")
+	assert.NoError(t, err)
+	_, err = store.Get(context.Background(), "r3")
+	assert.NoError(t, err)
+	assert.Equal(t, "", nextRefreshToken("r1", now))
+	assert.Equal(t, "r3", nextRefreshToken("r2", now))
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestLogoutHandlerKeepsIdempotentBehaviorForAtomicRevoke(t *testing.T) {
+	auth, err := New(&ToukaJWTMiddleware{
+		Realm: "test",
+		Key:   testPrivateKey(t),
+	})
+	require.NoError(t, err)
+
+	store := &recordingRevokerStore{
+		tokens:    map[string]any{"r1": "admin"},
+		revokeErr: core.ErrRefreshTokenNotFound,
+	}
+	auth.TokenStore = store
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	form := strings.NewReader("refresh_token=r1")
+	req := httptest.NewRequest(http.MethodPost, "/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Len(t, store.revokeCalls, 1)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
 func toukaHandlerForAlgorithm(auth *ToukaJWTMiddleware) *touka.Engine {
 	r := touka.New()
 	r.POST("/login", auth.LoginHandler)

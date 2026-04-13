@@ -11,6 +11,7 @@ import (
 
 var _ core.TokenStore = &InMemoryRefreshTokenStore{}
 var _ core.RefreshTokenRotator = &InMemoryRefreshTokenStore{}
+var _ core.RefreshTokenRevoker = &InMemoryRefreshTokenStore{}
 
 type InMemoryRefreshTokenStore struct {
 	tokens  map[string]*core.RefreshTokenData
@@ -103,6 +104,21 @@ func (s *InMemoryRefreshTokenStore) Rotate(ctx context.Context, oldToken, newTok
 		UserData: userData,
 		Expiry:   expiry,
 		Created:  s.nowFunc(),
+	}
+	return nil
+}
+
+func (s *InMemoryRefreshTokenStore) Revoke(ctx context.Context, tokens []string) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		delete(s.tokens, token)
 	}
 	return nil
 }

@@ -112,10 +112,17 @@ type TokenStore interface {
 }
 
 type RefreshTokenRotator interface {
-    TokenStore
-    Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+	TokenStore
+	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
+}
+
+type RefreshTokenRevoker interface {
+	TokenStore
+	Revoke(ctx context.Context, tokens []string) error
 }
 ```
+
+实现此接口的 store 可以让 LogoutHandler 原子性地撤销整条 refresh token 链。
 
 `TokenStore` 用于持久化 refresh token 及其关联的 `userData`。默认实现是内存 store：`store.NewInMemoryRefreshTokenStoreWithClock(mw.TimeFunc)`。
 
@@ -165,7 +172,7 @@ func (mw *ToukaJWTMiddleware) LoginHandler(c *touka.Context)
 ### 内部流程
 
 1. 调用 `Authenticator(c)` 验证用户凭据
-2. 若认证失败，调用 `unauthorized` 返回 401，并设置 `WWW-Authenticate` 响应头；当 `DisabledAbort` 为 `false` 时会先 `Abort`
+2. 若认证失败，调用 `unauthorized` 返回 401，**始终**设置 `WWW-Authenticate` 响应头；当 `DisabledAbort` 为 `false` 时会先 `Abort`
 3. 调用 `TokenGenerator` 生成 token pair
 4. 调用 `setAccessTokenCookie` 设置 access token cookie（内部检查 `SendCookie`，仅在 `SendCookie=true` 时写入）
 5. 调用 `SetRefreshTokenCookie` 设置 refresh token cookie（内部检查 `SendCookie`，仅在 `SendCookie=true` 时写入）
@@ -337,7 +344,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 ### 内部流程
 
 1. 按顺序从 cookie 或 form body 提取 refresh token
-2. 若找到 refresh token，按当前进程内记录的 successor 链继续查找后继 refresh token，并从 `TokenStore` 中删除这些相关 token
+2. 若找到 refresh token，按当前进程内记录且仍未过期的 successor 链获取可撤销链。若 store 实现 RefreshTokenRevoker 接口，调用 Revoke 原子撤销整链；否则逐个 Delete
 3. 删除过程中会忽略 `core.ErrRefreshTokenNotFound` 和 `core.ErrRefreshTokenExpired`
 4. 若删除出现其他错误，返回 500
 5. 若 `SendCookie` 为 true，清除 `CookieName` 和 `RefreshTokenCookieName` 对应的 cookie
@@ -349,7 +356,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context)
 engine.POST("/logout", auth.LogoutHandler)
 ```
 
-注意：`LogoutHandler` 会基于当前进程内记录的 refresh token successor 链删除相关 token，同时清除客户端 cookie。该链不是持久化状态，也不是跨实例共享状态；如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
+注意：`LogoutHandler` 会基于当前进程内记录的 refresh token successor 链删除相关 token，同时清除客户端 cookie。logout 只会沿仍未过期的 successor 映射继续追链；过期映射会被视为链路中断。该链不是持久化状态，也不是跨实例共享状态；如果只想清除 cookie 而不撤销 token，可以在调用 `LogoutHandler` 之前自行处理。
 
 ---
 

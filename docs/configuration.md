@@ -71,9 +71,9 @@
 
 验签公钥加载优先级：
 
-1. `PubKeyBytes`
-2. `PubKeyFile`
-3. 从 `Key` 派生公钥
+1. `PubKeyFile`（有文件路径时从文件加载，会覆盖 PubKeyBytes）
+2. `PubKeyBytes`（仅有字节数组时使用）
+3. 从 `Key` 派生公钥（当前两项都缺失时）
 
 若使用公钥验签模式（Verify-Only），只需提供 `PubKeyBytes` 或 `PubKeyFile`，此时 `LoginHandler` 和 `RefreshHandler` 会因缺少私钥而失败。
 
