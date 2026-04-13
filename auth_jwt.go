@@ -423,9 +423,7 @@ func (mw *ToukaJWTMiddleware) LogoutHandler(c *touka.Context) {
 			mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(err, c))
 			return
 		}
-		for _, token := range tokens {
-			deleteRefreshTokenSuccessor(token)
-		}
+		deleteRefreshTokenSuccessors(tokens)
 	}
 	if mw.SendCookie {
 		mw.writeCookie(c, mw.CookieName, "", -1, mw.SecureCookie, mw.CookieHTTPOnly)
@@ -886,7 +884,7 @@ func lockRefreshTokenChain(token string, now time.Time) ([]string, func()) {
 		seen[token] = struct{}{}
 		unlockers = append(unlockers, acquireRefreshTokenLock(token))
 		tokens = append(tokens, token)
-		token = nextRefreshToken(token, now)
+		token = logoutSuccessorToken(token)
 	}
 	return tokens, func() {
 		for i := len(unlockers) - 1; i >= 0; i-- {
@@ -921,9 +919,30 @@ func nextRefreshToken(token string, now time.Time) string {
 	return entry.next
 }
 
+func logoutSuccessorToken(token string) string {
+	refreshTokenChainMu.Lock()
+	entry, ok := refreshTokenChain[token]
+	refreshTokenChainMu.Unlock()
+	if !ok {
+		return ""
+	}
+	return entry.next
+}
+
 func deleteRefreshTokenSuccessor(token string) {
 	refreshTokenChainMu.Lock()
 	delete(refreshTokenChain, token)
+	refreshTokenChainMu.Unlock()
+}
+
+func deleteRefreshTokenSuccessors(tokens []string) {
+	if len(tokens) == 0 {
+		return
+	}
+	refreshTokenChainMu.Lock()
+	for _, token := range tokens {
+		delete(refreshTokenChain, token)
+	}
 	refreshTokenChainMu.Unlock()
 }
 

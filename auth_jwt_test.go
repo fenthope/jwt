@@ -991,6 +991,43 @@ func TestLogoutHandlerUsesAtomicRevokeWhenAvailable(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestLogoutHandlerRevokesKnownSuccessorsPastExpiredLink(t *testing.T) {
+	auth, err := New(&ToukaJWTMiddleware{
+		Realm: "test",
+		Key:   testPrivateKey(t),
+	})
+	require.NoError(t, err)
+
+	store := &recordingRevokerStore{tokens: map[string]any{
+		"r1": "admin",
+		"r2": "admin",
+		"r3": "admin",
+	}}
+	auth.TokenStore = store
+
+	now := time.Now()
+	setRefreshTokenSuccessor("r1", "r2", now.Add(-time.Second), now)
+	setRefreshTokenSuccessor("r2", "r3", now.Add(time.Minute), now)
+
+	w := httptest.NewRecorder()
+	c, _ := touka.CreateTestContext(w)
+	form := strings.NewReader("refresh_token=r1")
+	req := httptest.NewRequest(http.MethodPost, "/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Request = req
+
+	auth.LogoutHandler(c)
+
+	assert.Len(t, store.revokeCalls, 1)
+	assert.Equal(t, []string{"r1", "r2", "r3"}, store.revokeCalls[0].tokens)
+	for _, token := range []string{"r1", "r2", "r3"} {
+		_, err := store.Get(context.Background(), token)
+		assert.ErrorIs(t, err, core.ErrRefreshTokenNotFound)
+		assert.Equal(t, "", logoutSuccessorToken(token))
+	}
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
 func TestLogoutHandlerKeepsIdempotentBehaviorForAtomicRevoke(t *testing.T) {
 	auth, err := New(&ToukaJWTMiddleware{
 		Realm: "test",
