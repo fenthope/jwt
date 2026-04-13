@@ -40,6 +40,21 @@ type RefreshTokenRotator interface {
 	Rotate(ctx context.Context, oldToken, newToken string, userData any, expiry time.Time) error
 }
 
+// RefreshTokenRevoker atomically revokes one or more refresh tokens.
+// Stores that implement this can avoid partial logout state when a logout
+// request needs to invalidate a known successor chain.
+//
+// Revoke must apply to the full batch atomically: on success, every token in
+// the provided slice is no longer usable. Implementations should also keep the
+// operation idempotent for logout semantics. If Revoke returns
+// ErrRefreshTokenNotFound or ErrRefreshTokenExpired, callers assume every token
+// in the batch is already absent or unusable and may clear any in-memory logout
+// bookkeeping for the whole chain.
+type RefreshTokenRevoker interface {
+	TokenStore
+	Revoke(ctx context.Context, tokens []string) error
+}
+
 // RefreshTokenData holds the data stored with each refresh token
 type RefreshTokenData struct {
 	UserData any       `json:"user_data"`

@@ -162,11 +162,14 @@ func (mw *ToukaJWTMiddleware) rotateRefreshToken(ctx context.Context, oldToken, 
 
 当前实现不仅在 refresh 时加锁，还维护了一个进程内 successor 链：旧 refresh token 轮换成功后，会记录 `old -> new` 映射；`LogoutHandler` 会从当前 refresh token 开始，沿着这条链删除后继 token，尽量覆盖同一进程内发生过的连续轮换。
 
+当底层 store 实现 `core.RefreshTokenRevoker` 时，middleware 会把整条已知链作为一个批次交给 `Revoke`。该接口的契约是：要么整批 token 一次性失效，要么返回错误；并且 logout 语义要求该操作对“已不存在/已过期”的 token 保持幂等。也就是说，`Revoke` 若返回 `ErrRefreshTokenNotFound` 或 `ErrRefreshTokenExpired`，应表示这一批 token 已经整体不可用，而不是只表示其中某一个 token 删除失败。
+
 这带来以下安全语义：
 
 - 同进程并发 refresh：`oldToken` 上的互斥锁能序列化 `rotateRefreshToken`
 - refresh 时的 `MaxRefreshUntil` 会在进入 handler 后校验一次，在持锁轮换时再校验一次，避免并发窗口绕过过期判断
 - logout 只会沿着当前进程内记住的 successor 链继续删除；如果链信息不存在，logout 只删除当前提交上来的 refresh token
+- 实现了 `RefreshTokenRevoker` 的 store 可以把“当前 token 以及已知 successor 链的删除”下推为一次原子撤销；若未实现，则 middleware 退回逐个 `Delete`
 - successor 链仅用于后续 logout 清理，不参与 refresh 鉴权；真正决定 refresh 是否成功的仍是 store 中旧 token 的存在性、过期时间和 `MaxRefreshUntil`
 
 ### 2.5 多实例与非原子轮换风险
