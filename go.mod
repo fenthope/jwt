@@ -6,13 +6,13 @@ require (
 	filippo.io/mldsa v0.0.0-20260215214346-43d0283efc3e
 	github.com/appleboy/gofight/v2 v2.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/infinite-iroha/touka v0.5.1-0.20260409232140-271e54eb4d44
+	github.com/infinite-iroha/touka v1.0.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.18.0
 )
 
 require (
-	github.com/WJQSERVER-STUDIO/go-utils/iox v0.0.2 // indirect
+	github.com/WJQSERVER-STUDIO/go-utils/iox v0.0.3 // indirect
 	github.com/WJQSERVER-STUDIO/httpc v0.9.0 // indirect
 	github.com/WJQSERVER/wanf v0.0.8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
