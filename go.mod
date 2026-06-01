@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	filippo.io/mldsa v0.0.0-20260215214346-43d0283efc3e
-	github.com/appleboy/gofight/v2 v2.2.1
+	github.com/appleboy/gofight/v2 v2.2.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/infinite-iroha/touka v0.5.1-0.20260409232140-271e54eb4d44
 	github.com/stretchr/testify v1.11.1
